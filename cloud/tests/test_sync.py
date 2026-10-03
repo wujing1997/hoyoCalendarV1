@@ -22,6 +22,55 @@ def _pull(client, user, cursor=None):
     return client["api"].get(url, headers=auth_headers(user["access_token"]))
 
 
+def test_snapshot_includes_active_and_deleted_records_at_one_watermark(client):
+    user = make_user(client)
+    a, b = new_event_id(), new_event_id()
+    _push(client, user, [upsert_change(a, 1, 0, {"event": "保留"}), upsert_change(b, 1, 0, {"event": "删除"})])
+    pushed = _push(client, user, [upsert_change(b, 2, 1, None, op="delete")]).json()
+    response = client["api"].get("/api/v1/sync/snapshot", headers=auth_headers(user["access_token"]))
+    assert response.status_code == 200
+    snapshot = response.json()
+    assert snapshot["cursor"] == pushed["cursor"]
+    assert {event["eventId"] for event in snapshot["events"]} == {a, b}
+    assert next(event for event in snapshot["events"] if event["eventId"] == b)["deleted"] is True
+    other = make_user(client)
+    empty = client["api"].get("/api/v1/sync/snapshot", headers=auth_headers(other["access_token"])).json()
+    assert empty == {"cursor": 0, "events": []}
+
+
+def test_snapshot_requires_authentication(client):
+    assert client["api"].get("/api/v1/sync/snapshot").status_code == 401
+
+
+def test_concurrent_updates_accept_one_and_conflict_the_other(client):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from app.database import SessionLocal
+    from app.modules.sync import service
+    from app.schemas import EventChange
+    from app import models
+    from sqlalchemy import select
+
+    user = make_user(client)
+    event_id = new_event_id()
+    _push(client, user, [upsert_change(event_id, 1, 0, {"event": "初始"})])
+    with SessionLocal() as db:
+        user_id = db.execute(select(models.User.id).where(models.User.email == user["email"])).scalar_one()
+    barrier = Barrier(2)
+
+    def update(title):
+        change = EventChange(**upsert_change(event_id, 2, 1, {"event": title})).model_dump()
+        with SessionLocal() as db:
+            barrier.wait(timeout=10)
+            results, _ = service.apply_push(db, user_id, [change])
+            return results[0]["status"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(update, ["设备 A", "设备 B"]))
+    assert sorted(statuses) == ["applied", "conflict"]
+    assert _pull(client, user).json()["events"][0]["version"] == 2
+
+
 def test_push_then_pull_roundtrip(client):
     user = make_user(client)
     event_id = new_event_id()

@@ -118,6 +118,11 @@ class RestoreRequest(BaseModel):
     eventId: uuid.UUID
 
 
+class SyncSnapshotResponse(BaseModel):
+    cursor: int
+    events: List[CloudEvent]
+
+
 class TrashItem(BaseModel):
     eventId: uuid.UUID
     version: int

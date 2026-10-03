@@ -359,6 +359,55 @@
         }
       }
     },
+    "/api/v1/sync/snapshot": {
+      "get": {
+        "tags": [
+          "sync"
+        ],
+        "summary": "Snapshot",
+        "operationId": "snapshot_api_v1_sync_snapshot_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncSnapshotResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sync/pull": {
       "get": {
         "tags": [
@@ -1388,6 +1437,27 @@
           "eventId"
         ],
         "title": "RestoreRequest"
+      },
+      "SyncSnapshotResponse": {
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "title": "Cursor"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/CloudEvent"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cursor",
+          "events"
+        ],
+        "title": "SyncSnapshotResponse"
       },
       "TokenResponse": {
         "properties": {

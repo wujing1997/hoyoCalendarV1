@@ -266,6 +266,12 @@ class CloudApi {
     return response.data;
   }
 
+  async snapshot() {
+    const response = await this.authCall('/api/v1/sync/snapshot');
+    requireOk(response, '同步校验失败');
+    return response.data;
+  }
+
   async trash() {
     const response = await this.authCall('/api/v1/sync/trash');
     requireOk(response, '获取回收站失败');

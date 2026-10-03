@@ -14,6 +14,7 @@ from ...schemas import (
     PullResponse,
     PushRequest,
     PushResponse,
+    SyncSnapshotResponse,
     RestoreRequest,
     TrashItem,
     TrashListResponse,
@@ -21,6 +22,11 @@ from ...schemas import (
 from . import service
 
 router = APIRouter(tags=["sync"])
+
+
+@router.get("/snapshot", response_model=SyncSnapshotResponse)
+def snapshot(current=Depends(require_user), db: Session = Depends(get_db)):
+    return service.snapshot(db, current["user"].id)
 
 
 @router.get("/pull", response_model=PullResponse)

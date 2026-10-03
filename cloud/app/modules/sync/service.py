@@ -74,6 +74,8 @@ def _row_to_cloud_event(row: models.CalendarEvent) -> dict:
 
 
 def apply_push(db: Session, user_id: uuid.UUID, changes: list) -> list:
+    # Serialize version checks and the first cursor creation for this account.
+    db.execute(select(models.User).where(models.User.id == user_id).with_for_update()).scalar_one()
     results = []
     for change in changes:
         event_id = change["eventId"]
@@ -206,6 +208,22 @@ def current_cursor(db: Session, user_id: uuid.UUID) -> int:
     return cursor.last_seq if cursor else 0
 
 
+def snapshot(db: Session, user_id: uuid.UUID) -> dict:
+    # One SQL statement: records and watermark share a PostgreSQL MVCC snapshot.
+    rows = db.execute(
+        select(models.CalendarEvent, models.SyncCursor.last_seq)
+        .select_from(models.User)
+        .outerjoin(models.SyncCursor, models.SyncCursor.user_id == models.User.id)
+        .outerjoin(models.CalendarEvent, models.CalendarEvent.user_id == models.User.id)
+        .where(models.User.id == user_id)
+        .order_by(models.CalendarEvent.seq)
+    ).all()
+    return {
+        "cursor": int(rows[0][1] or 0) if rows else 0,
+        "events": [_row_to_cloud_event(row[0]) for row in rows if row[0] is not None],
+    }
+
+
 def _min_seq(db: Session, user_id: uuid.UUID) -> Optional[int]:
     return db.execute(
         select(func.min(models.CalendarEvent.seq)).where(
@@ -279,6 +297,7 @@ def list_trash(db: Session, user_id: uuid.UUID) -> list:
 
 
 def restore(db: Session, user_id: uuid.UUID, event_id: uuid.UUID) -> dict:
+    db.execute(select(models.User).where(models.User.id == user_id).with_for_update()).scalar_one()
     row = db.execute(
         select(models.CalendarEvent).where(
             models.CalendarEvent.user_id == user_id,

@@ -98,8 +98,13 @@ class FakeCloudApi {
       throw new Error('ECONNREFUSED');
     }
     const all = [...this.events.values()].sort((a, b) => a.seq - b.seq);
-    const events = all.filter((event) => event.seq > (cursor || 0)).slice(0, limit);
-    return { cursor: events.length ? events[events.length - 1].seq : cursor || 0, hasMore: false, reconcileRequired: false, events };
+    const remaining = all.filter((event) => event.seq > (cursor || 0));
+    const events = remaining.slice(0, limit);
+    return { cursor: events.length ? events[events.length - 1].seq : cursor || 0, hasMore: remaining.length > limit, reconcileRequired: false, events };
+  }
+
+  async snapshot() {
+    return { cursor: this.seq, events: [...this.events.values()].sort((a, b) => a.seq - b.seq) };
   }
 
   async push(changes) {
@@ -171,6 +176,169 @@ class FakeCloudApi {
   }
 }
 
+test('a push cannot skip another device change committed between pull and push', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    engine.state.calibrated = true;
+    const event = engine.__store.addEvent({ event: '电脑新增', date: '2026-10-03' });
+    engine.noteLocalChange(event.id, 'upsert');
+    const push = engine.__api.push.bind(engine.__api);
+    engine.__api.push = async (changes) => {
+      engine.__api.seedServerEvent('phone-event', { event: '手机新增', date: '2026-10-03' });
+      return push(changes);
+    };
+    assert.equal(await engine.syncNow(), true);
+    assert.equal(engine.__store.loadEvents().length, 2);
+    assert.equal(engine.state.verifiedCursor, engine.__api.seq);
+    assert.ok(engine.state.verifiedHash);
+  });
+});
+
+test('a new local edit during upload survives acknowledgement and is uploaded next', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    const event = engine.__store.addEvent({ event: '第一版', date: '2026-10-03' });
+    engine.noteLocalChange(event.id, 'upsert');
+    const push = engine.__api.push.bind(engine.__api);
+    let edited = false;
+    engine.__api.push = async (changes) => {
+      if (!edited) {
+        edited = true;
+        engine.__store.updateEvent(event.id, { event: '第二版' });
+        engine.noteLocalChange(event.id, 'upsert');
+      }
+      return push(changes);
+    };
+    assert.equal(await engine.syncNow(), true);
+    assert.equal(engine.__api.events.get(event._uuid).data.event, '第二版');
+    assert.equal(engine.__store.getEvent(event.id).event, '第二版');
+    assert.equal(engine.queue.length, 0);
+  });
+});
+
+test('snapshot calibration repairs a persisted cursor that already skipped records', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    engine.__api.seedServerEvent('missed', { event: '过去漏掉的任务', date: '2026-10-03', isLongTerm: true });
+    engine.state.cursor = 999;
+    engine.__store.addEvent({ event: '本机独有', date: '2026-10-03' });
+    assert.equal(await engine.syncNow(), true);
+    assert.equal(engine.__store.loadEvents().length, 2);
+    assert.ok(fs.existsSync(engine.state.syncRepairBackup));
+    assert.equal(engine.state.cursor, engine.__api.seq);
+  });
+});
+
+test('manual and background synchronization share one in-flight cycle', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    let calls = 0;
+    const snapshot = engine.__api.snapshot.bind(engine.__api);
+    engine.__api.snapshot = async () => { calls += 1; return snapshot(); };
+    const first = engine.syncNow();
+    assert.equal(first, engine.syncNow());
+    assert.equal(await first, true);
+    assert.equal(calls, 2);
+  });
+});
+
+test('failed pulls and failed disk writes never report verified success', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    engine.state.calibrated = true;
+    engine.__api.failNext = 'pull';
+    assert.equal(await engine.syncNow(), false);
+    assert.equal(engine.state.verifiedAt, null);
+    const save = engine.__store.saveEvents;
+    engine.__store.saveEvents = () => false;
+    assert.equal(await engine.syncNow(), false);
+    assert.match(engine.state.lastError, /写入失败/);
+    engine.__store.saveEvents = save;
+  });
+});
+
+test('equal versions with differing content require an explicit conflict choice', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    engine.__api.seedServerEvent('same', { event: '云端', date: '2026-10-03' });
+    const local = engine.__store.applyRemoteEvent('same', { event: '本机', date: '2026-10-03' }, 1, 'op-local');
+    assert.equal(await engine.syncNow(), false);
+    assert.equal(engine.__store.getEvent(local.id).event, '本机');
+    assert.equal(engine.state.conflicts.length, 1);
+    await engine.resolveConflict('same', 'server');
+    assert.equal(await engine.syncNow(), true);
+    assert.equal(engine.__store.getEvent(local.id).event, '云端');
+  });
+});
+
+test('snapshot propagates deleted records even with a previously advanced cursor', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    const local = engine.__store.applyRemoteEvent('removed', { event: '已删除', date: '2026-10-03' }, 1, 'op-old');
+    engine.__api.seedServerEvent('removed', null, 2, 'op-delete', true);
+    engine.state.cursor = 99;
+    assert.equal(await engine.syncNow(), true);
+    assert.equal(engine.__store.getEvent(local.id), null);
+    assert.equal(engine.__store.listTrash().length, 1);
+  });
+});
+
+test('hashes ignore device IDs and field ordering but include task contents', async () => {
+  await withEngine({}, async (engine) => {
+    const a = { id: 1, event: '任务', date: '2026-10-03', note: '备注' };
+    const b = { date: '2026-10-03', note: '备注', event: '任务', id: 999 };
+    assert.equal(engine.contentHash(a), engine.contentHash(b));
+    assert.notEqual(engine.contentHash(a), engine.contentHash({ ...b, time: '10:00' }));
+  });
+});
+
+test('two devices converge after concurrent additions and more than one upload batch', async () => {
+  const a = createEngine();
+  const b = createEngine();
+  b.api = a.api;
+  try {
+    a.account = b.account = { userId: 'user-1' };
+    for (let index = 0; index < 205; index += 1) {
+      const event = a.__store.addEvent({ event: `电脑 ${index}`, date: '2026-10-03' });
+      a.noteLocalChange(event.id, 'upsert');
+    }
+    const phone = b.__store.addEvent({ event: '手机任务', date: '2026-10-03', isRecurring: true, startDate: '2026-10-03' });
+    b.noteLocalChange(phone.id, 'upsert');
+    await Promise.all([a.syncNow(), b.syncNow()]);
+    assert.equal(await a.syncNow(), true);
+    assert.equal(await b.syncNow(), true);
+    assert.equal(a.__store.loadEvents().length, 206);
+    assert.equal(b.__store.loadEvents().length, 206);
+    assert.equal(a.state.verifiedHash, b.state.verifiedHash);
+    assert.equal(a.state.verifiedCursor, b.state.verifiedCursor);
+  } finally {
+    drainTimers(a); drainTimers(b);
+    fs.rmSync(a.__dataDir, { recursive: true, force: true });
+    fs.rmSync(b.__dataDir, { recursive: true, force: true });
+  }
+});
+
+test('new cloud versions remove old fields rather than overlaying them', async () => {
+  await withEngine({}, async (engine) => {
+    engine.account = { userId: 'user-1' };
+    const old = engine.__store.applyRemoteEvent('converted', { event: '旧任务', date: '2026-10-03', customOldField: 'remove' }, 1, 'old-op');
+    engine.__api.seedServerEvent('converted', { event: '新任务', date: '2026-10-03' }, 2, 'new-op');
+    assert.equal(await engine.syncNow(), true);
+    assert.equal(engine.__store.getEvent(old.id).customOldField, undefined);
+  });
+});
+
+test('incremental pulls consume every page and checkpoint only successful disk writes', async () => {
+  await withEngine({}, async (engine) => {
+    for (let index = 0; index < 503; index += 1) engine.__api.seedServerEvent(`event-${index}`, { event: `任务 ${index}` });
+    const events = await engine.collectPull(0, 500);
+    assert.equal(events.length, 503);
+    engine.__store.saveEvents = () => false;
+    await assert.rejects(engine.pullAll(), /写入本地失败/);
+    assert.equal(engine.state.cursor, 0);
+  });
+});
+
 function drainTimers(engine) {
   if (engine.flushTimer) clearTimeout(engine.flushTimer);
   engine.flushTimer = null;
@@ -234,6 +402,7 @@ test('push applies changes, drains queue and acks versions locally', async () =>
     const stored = engine.__store.getAnyEvent(created.id);
     assert.equal(stored._version, 1);
     assert.equal(stored._baseVersion, 1);
+    assert.equal(await engine.syncNow(), true);
     assert.equal(engine.getStatus(), SYNC_STATUS.SYNCED);
     assert.equal(engine.__api.events.get(created._uuid).data.event, '同步任务');
   });
@@ -682,7 +851,7 @@ function queueBackupFiles(dataDir) {
   return fs.readdirSync(dataDir).filter((name) => name.startsWith('sync-queue.backup-'));
 }
 
-function engineWithQueueFile(queueJson, callback) {
+async function engineWithQueueFile(queueJson, callback) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hoyo-sync-queue-'));
   fs.writeFileSync(path.join(dataDir, 'sync-queue.json'), queueJson, 'utf8');
   const store = new EventStore({ dataDir });
@@ -691,7 +860,7 @@ function engineWithQueueFile(queueJson, callback) {
   engine.__store = store;
   engine.__api = api;
   try {
-    return callback(engine, dataDir);
+    return await callback(engine, dataDir);
   } finally {
     drainTimers(engine);
     fs.rmSync(dataDir, { recursive: true, force: true });
@@ -706,6 +875,7 @@ test('legacy object sync-queue loads as empty without crashing and keeps a backu
     engine.account = { userId: 'u1', email: 'a@b.c' };
     engine.state.account = engine.account;
     await engine.flushPush();
+    assert.equal(await engine.syncNow(), true);
     assert.equal(engine.getStatus(), SYNC_STATUS.SYNCED);
   });
 });
@@ -815,6 +985,7 @@ test('malformed sync-queue json falls back to an empty queue without crashing', 
     engine.account = { userId: 'u1', email: 'a@b.c' };
     engine.state.account = engine.account;
     await engine.flushPush();
+    assert.equal(await engine.syncNow(), true);
     assert.equal(engine.getStatus(), SYNC_STATUS.SYNCED);
   });
 });

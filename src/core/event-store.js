@@ -410,7 +410,6 @@ class EventStore {
     const now = new Date().toISOString();
     if (index >= 0) {
       const next = this.normalizeEvent({
-        ...events[index],
         ...clone(data || {}),
         id: events[index].id,
         createdAt: events[index].createdAt,
@@ -470,7 +469,12 @@ class EventStore {
     const events = this.loadAllEvents();
     const index = events.findIndex((event) => event._uuid === eventId);
     if (index < 0) return null;
-    this.applyRemoteMeta(events[index], { eventId, version, operationId });
+    if (operationId && events[index]._opId !== operationId) {
+      events[index]._baseVersion = Number(version);
+      events[index]._version = Math.max(Number(events[index]._version), Number(version) + 1);
+    } else {
+      this.applyRemoteMeta(events[index], { eventId, version, operationId });
+    }
     return this.saveEvents(events) ? clone(events[index]) : null;
   }
 

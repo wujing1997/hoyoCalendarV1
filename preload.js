@@ -352,8 +352,9 @@ contextBridge.exposeInMainWorld('cloudAPI', {
 
   syncNow: async () => {
     try {
-      await syncEngine.syncNow();
-      return { ok: true };
+      const ok = await syncEngine.syncNow();
+      const snapshot = syncEngine.getSnapshot();
+      return { ok, message: snapshot.lastError || (snapshot.conflictCount ? '有同步冲突待处理' : '尚未完成同步，请检查登录和网络'), verifiedAt: snapshot.verifiedAt };
     } catch (error) {
       return { ok: false, message: friendlyCloudError(error) };
     }

@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 const { CloudApiError, DEFAULT_SERVER_URL, migrateLegacyServerUrl } = require('./cloud-api');
 
 const SYNC_STATUS = {
@@ -22,6 +22,12 @@ const RETRY_DELAYS_MS = [5000, 15000, 45000, 120000, 300000, 900000];
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
 }
 
 function readJsonFile(filePath, fallback) {
@@ -110,6 +116,7 @@ class SyncEngine {
     this.flushTimer = null;
     this.heartbeatTimer = null;
     this.syncing = false;
+    this.cyclePromise = null;
     this.lastPullAt = 0;
     this.dataRevision = 0;
     this.agentSessionId = typeof this.state.agentSessionId === 'string'
@@ -189,6 +196,7 @@ class SyncEngine {
     if (!this.isOnline()) return SYNC_STATUS.OFFLINE;
     if (this.queue.length > 0) return SYNC_STATUS.PENDING;
     if (this.state.lastError) return SYNC_STATUS.ERROR;
+    if (!this.state.verifiedAt) return SYNC_STATUS.PENDING;
     return SYNC_STATUS.SYNCED;
   }
 
@@ -206,6 +214,8 @@ class SyncEngine {
       migrationSummary: this.state.migrationSummary,
       migrationDone: this.state.migrationDone,
       dataRevision: this.dataRevision,
+      verifiedAt: this.state.verifiedAt || null,
+      verifiedCursor: this.state.verifiedCursor ?? null,
     };
   }
 
@@ -215,6 +225,11 @@ class SyncEngine {
 
   setServerUrl(url) {
     const next = String(url || '').trim() || DEFAULT_SERVER_URL;
+    if (next !== this.state.serverUrl) {
+      this.state.cursor = 0;
+      this.state.verifiedAt = null;
+      this.state.calibrated = false;
+    }
     this.state.serverUrl = next;
     this.api.baseUrl = next;
     this.persistState();
@@ -402,8 +417,14 @@ class SyncEngine {
         continue;
       }
       if (Number(remote.version) > Number(local._version || 0)) {
-        this.addConflict(remote.eventId, local, remote.data, remote.version);
-        conflicts.push(remote.eventId);
+        if (this.queue.some((entry) => entry.eventId === remote.eventId)
+          || Number(local._version || 0) > Number(local._baseVersion || 0)) {
+          this.addConflict(remote.eventId, local, remote.data, remote.version);
+          conflicts.push(remote.eventId);
+        } else {
+          this.applyCloudEvent(remote);
+          merged.push(remote.eventId);
+        }
       } else {
         merged.push(remote.eventId);
       }
@@ -435,6 +456,7 @@ class SyncEngine {
   // ------------------------------------------------------------------ queue & push
 
   enqueueChange(eventId, operationId, op, event) {
+    this.state.verifiedAt = null;
     const entry = {
       eventId,
       operationId,
@@ -469,26 +491,36 @@ class SyncEngine {
   schedulePush() {
     clearTimeout(this.flushTimer);
     this.flushTimer = setTimeout(() => {
-      this.flushPush();
+      this.flushTimer = null;
+      this.syncNow();
     }, 3000);
   }
 
-  async flushPush() {
+  flushPush(options = {}) {
+    if (this.cyclePromise && !options.internal) return this.cyclePromise;
+    if (this.pushPromise) return this.pushPromise;
+    this.pushPromise = this.runFlushPush(options).finally(() => { this.pushPromise = null; });
+    return this.pushPromise;
+  }
+
+  async runFlushPush(options = {}) {
     if (this.syncing || !this.account || !this.isOnline() || !this.api.getAuthenticated()) return;
     const now = Date.now();
-    const due = this.queue.filter((entry) => entry.nextRetryAt <= now).slice(0, PUSH_LIMIT);
+    const due = this.queue.filter((entry) => options.force || entry.nextRetryAt <= now).slice(0, PUSH_LIMIT);
     if (!due.length) return;
     this.syncing = true;
+    const scope = this.syncScope();
     try {
       const result = await this.api.push(due);
-      this.state.cursor = Math.max(this.state.cursor, Number(result.cursor) || 0);
+      this.assertSyncScope(scope);
       const doneIds = new Set();
       for (const item of result.results || []) {
-        const entry = this.queue.find((queued) => queued.eventId === item.eventId);
+        const entry = due.find((queued) => queued.eventId === item.eventId);
+        if (!entry) continue;
         if (item.status === 'conflict') {
           const local = this.eventStore.findEventByUuid(item.eventId);
           this.addConflict(item.eventId, local, item.serverData, item.serverVersion);
-          doneIds.add(item.eventId);
+          doneIds.add(entry.operationId);
           continue;
         }
         if (item.status === 'error') {
@@ -496,16 +528,23 @@ class SyncEngine {
           if (pending) pending.attempts += 1;
           continue;
         }
-        this.eventStore.applySyncAck(
+        if (!['applied', 'idempotent'].includes(item.status)) continue;
+        const ack = this.eventStore.applySyncAck(
           item.eventId,
           item.version,
           entry?.operationId || undefined,
         );
-        doneIds.add(item.eventId);
+        if (!ack && this.eventStore.findEventByUuid(item.eventId)) throw new Error('本地同步确认写入失败');
+        const newer = this.queue.find((queued) => queued.eventId === item.eventId && queued.operationId !== entry.operationId);
+        if (newer) {
+          newer.baseVersion = Number(item.version);
+          newer.version = Math.max(newer.version, Number(item.version) + 1);
+        }
+        doneIds.add(entry.operationId);
       }
       if (doneIds.size) {
-        this.queue = this.queue.filter((entry) => !doneIds.has(entry.eventId));
-        this.persistQueue();
+        this.queue = this.queue.filter((entry) => !doneIds.has(entry.operationId));
+        if (!this.persistQueue()) throw new Error('本地同步队列写入失败');
       }
       this.state.lastError = null;
       this.state.lastSyncAt = new Date().toISOString();
@@ -544,7 +583,7 @@ class SyncEngine {
     const delay = Math.max(1000, next - now);
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.flushPush();
+      this.syncNow();
     }, Math.min(delay, 900000));
   }
 
@@ -556,18 +595,22 @@ class SyncEngine {
     for (;;) {
       const page = await this.api.pull(next, limit);
       events.push(...(page.events || []));
+      const previous = next;
       next = page.cursor ?? next;
+      if (page.hasMore && next <= previous) throw new Error('云端分页没有前进，同步已暂停');
       if (!page.hasMore) break;
     }
     return events;
   }
 
   async pullAll() {
+    const scope = this.syncScope();
     const events = await this.collectPull(this.state.cursor, PULL_LIMIT);
-    this.state.cursor = events.length ? Math.max(this.state.cursor, events[events.length - 1].seq) : this.state.cursor;
+    this.assertSyncScope(scope);
     for (const remote of events) {
       this.applyCloudEvent(remote);
     }
+    this.state.cursor = events.length ? Math.max(this.state.cursor, events[events.length - 1].seq) : this.state.cursor;
     if (events.length > 0) this.dataRevision += 1;
     this.state.lastSyncAt = new Date().toISOString();
     this.persistState();
@@ -596,12 +639,12 @@ class SyncEngine {
         return;
       }
       if (remote.data) {
-        this.eventStore.applyRemoteEvent(eventId, remote.data, remote.version, remote.operationId);
+        if (!this.eventStore.applyRemoteEvent(eventId, remote.data, remote.version, remote.operationId)) throw new Error('云端日程写入本地失败');
       }
       return;
     }
 
-    if (String(local._opId) === String(remote.operationId)) return;
+    if (String(local._opId) === String(remote.operationId) && !remote.deleted) return;
 
     if (pending) {
       if (Number(remote.version) >= Number(local._version || 0)) {
@@ -619,13 +662,13 @@ class SyncEngine {
     }
 
     if (Number(remote.version) > Number(local._version || 0)) {
-      this.eventStore.applyRemoteEvent(eventId, remote.data, remote.version, remote.operationId);
+      if (!this.eventStore.applyRemoteEvent(eventId, remote.data, remote.version, remote.operationId)) throw new Error('云端日程写入本地失败');
     } else if (Number(remote.version) === Number(local._version || 0)) {
       const events = this.eventStore.loadAllEvents();
       const index = events.findIndex((item) => item._uuid === eventId);
       if (index >= 0) {
         this.eventStore.applyRemoteMeta(events[index], { eventId, operationId: remote.operationId });
-        this.eventStore.saveEvents(events);
+        if (!this.eventStore.saveEvents(events)) throw new Error('云端日程元数据写入失败');
       }
     }
   }
@@ -656,25 +699,30 @@ class SyncEngine {
   async resolveConflict(eventId, choice) {
     const conflict = this.state.conflicts.find((item) => item.eventId === eventId);
     if (!conflict) return false;
-    this.state.conflicts = this.state.conflicts.filter((item) => item.eventId !== eventId);
-    this.persistState();
-
     const local = this.eventStore.findEventByUuid(eventId);
     if (choice === 'server') {
       if (conflict.server) {
         if (local) {
-          this.eventStore.applyRemoteEvent(
+          if (!this.eventStore.applyRemoteEvent(
             eventId,
             conflict.server,
             conflict.serverVersion,
             this.eventStore.generateUuid(),
-          );
+          )) throw new Error('冲突处理写入失败');
         }
       } else if (local) {
         const trashUntil = new Date();
         trashUntil.setDate(trashUntil.getDate() + TRASH_RETENTION_DAYS);
-        this.eventStore.markTrashedFromRemote(eventId, trashUntil.toISOString().slice(0, 10));
+        const events = this.eventStore.loadAllEvents();
+        const event = events.find((item) => item._uuid === eventId);
+        event._deleted = true;
+        event._deletedAt = new Date().toISOString();
+        event._trashUntil = trashUntil.toISOString().slice(0, 10);
+        this.eventStore.applyRemoteMeta(event, { eventId, version: conflict.serverVersion });
+        if (!this.eventStore.saveEvents(events)) throw new Error('冲突处理写入失败');
       }
+      this.queue = this.queue.filter((entry) => entry.eventId !== eventId);
+      this.persistQueue();
     } else if (choice === 'local' && local) {
       const next = clone(local);
       next._baseVersion = conflict.serverVersion;
@@ -684,10 +732,14 @@ class SyncEngine {
       const index = events.findIndex((item) => item._uuid === eventId);
       if (index >= 0) {
         events[index] = next;
-        this.eventStore.saveEvents(events);
-        this.enqueueChange(eventId, next._opId, 'upsert', next);
+        if (!this.eventStore.saveEvents(events)) throw new Error('冲突处理写入失败');
+        this.enqueueChange(eventId, next._opId, next._deleted ? 'delete' : 'upsert', next);
       }
     }
+    this.state.conflicts = this.state.conflicts.filter((item) => item.eventId !== eventId);
+    this.state.verifiedAt = null;
+    this.persistState();
+    this.dataRevision += 1;
     this.notify();
     this.schedulePush();
     return true;
@@ -879,19 +931,153 @@ class SyncEngine {
 
   // ------------------------------------------------------------------ lifecycle
 
-  async syncNow(options = {}) {
-    if (!this.account || !this.api.getAuthenticated()) return false;
-    if (options.pull !== false && this.isOnline()) {
-      try {
-        await this.pullAll();
-      } catch (error) {
-        this.state.lastError = error.message || '拉取失败';
-        this.persistState();
+  syncNow(options = {}) {
+    if (this.cyclePromise) return this.cyclePromise;
+    this.cyclePromise = Promise.resolve().then(() => this.runSyncCycle(options)).finally(() => {
+      this.cyclePromise = null;
+      this.notify();
+    });
+    return this.cyclePromise;
+  }
+
+  contentHash(event) {
+    const content = this.eventStore.sanitizeForSync(this.eventStore.normalizeEvent(event));
+    for (const key of ['id', 'createdAt', 'updatedAt']) delete content[key];
+    return createHash('sha256').update(canonical(content)).digest('hex');
+  }
+
+  async reconcileSnapshot() {
+    const scope = this.syncScope();
+    const snapshot = await this.api.snapshot();
+    this.assertSyncScope(scope);
+    if (!Array.isArray(snapshot.events) || !Number.isSafeInteger(snapshot.cursor)) throw new Error('云端校验响应无效');
+    const events = this.eventStore.loadAllEvents();
+    const locals = new Map(events.map((event) => [event._uuid, event]));
+    const remoteIds = new Set(snapshot.events.map((event) => event.eventId));
+    if (!this.state.calibrated && fs.existsSync(this.eventStore.eventsFile)) {
+      const backup = path.join(this.dataDir, `events.sync-repair-${Date.now()}.json`);
+      fs.copyFileSync(this.eventStore.eventsFile, backup);
+      this.state.syncRepairBackup = backup;
+    }
+    for (const remote of snapshot.events) {
+      const local = locals.get(remote.eventId);
+      const pending = this.queue.some((entry) => entry.eventId === remote.eventId);
+      const dirty = local && Number(local._version || 0) > Number(local._baseVersion || 0);
+      const equal = local && Boolean(local._deleted) === Boolean(remote.deleted)
+        && Number(local._version) === remote.version
+        && (remote.deleted || this.contentHash(local) === this.contentHash(remote.data));
+      if (equal) {
+        if (!pending) this.eventStore.applyRemoteMeta(local, remote);
+        continue;
+      }
+      if ((pending || dirty) && local && remote.version <= Number(local._baseVersion || 0)) {
+        if (!pending) this.enqueueChange(local._uuid, local._opId, local._deleted ? 'delete' : 'upsert', local);
+        continue;
+      }
+      if (pending || dirty || (local && !remote.deleted && Number(local._version) >= remote.version)) {
+        this.addConflict(remote.eventId, local, remote.deleted ? null : remote.data, remote.version);
+        continue;
+      }
+      if (remote.deleted) {
+        if (local) {
+          local._deleted = true;
+          local._trashUntil = remote.trashUntil;
+          local._deletedAt = local._deletedAt || new Date().toISOString();
+          this.eventStore.applyRemoteMeta(local, remote);
+        }
+      } else {
+        const next = this.eventStore.normalizeEvent({ ...remote.data,
+          id: local?.id || this.eventStore.generateId(),
+          createdAt: local?.createdAt || remote.data?.createdAt || new Date().toISOString(),
+        });
+        this.eventStore.applyRemoteMeta(next, remote);
+        if (local) events[events.indexOf(local)] = next;
+        else events.push(next);
       }
     }
-    await this.flushPush();
-    this.notify();
-    return true;
+    for (const local of events) {
+      if (remoteIds.has(local._uuid) || local._deleted || this.queue.some((entry) => entry.eventId === local._uuid)) continue;
+      if (!Number(local._baseVersion || 0)) this.enqueueChange(local._uuid, local._opId, 'upsert', local);
+      else this.addConflict(local._uuid, local, null, Number(local._baseVersion));
+    }
+    if (!this.eventStore.saveEvents(events)) throw new Error('本地日程写入失败，未确认同步完成');
+    if (!this.persistQueue()) throw new Error('本地同步队列写入失败，未确认同步完成');
+    this.dataRevision += 1;
+    this.state.cursor = snapshot.cursor;
+    this.state.calibrated = true;
+    const saved = new Map(this.eventStore.loadAllEvents().map((event) => [event._uuid, event]));
+    const expected = snapshot.events.map((remote) => ({ id: remote.eventId, version: remote.version,
+      deleted: remote.deleted, hash: remote.deleted ? null : this.contentHash(remote.data) })).sort((a, b) => a.id.localeCompare(b.id));
+    const actual = snapshot.events.map((remote) => {
+      const local = saved.get(remote.eventId);
+      return { id: remote.eventId, version: local?._version ?? (remote.deleted ? remote.version : -1),
+        deleted: local ? Boolean(local._deleted) : remote.deleted,
+        hash: local && !local._deleted ? this.contentHash(local) : null };
+    }).sort((a, b) => a.id.localeCompare(b.id));
+    const digest = (value) => createHash('sha256').update(canonical(value)).digest('hex');
+    const matched = digest(expected) === digest(actual)
+      && !this.queue.length && !this.state.conflicts.length;
+    this.state.verifiedAt = matched ? new Date().toISOString() : null;
+    this.state.verifiedCursor = matched ? snapshot.cursor : null;
+    this.state.verifiedHash = matched ? digest(actual) : null;
+    if (!this.persistStateChecked()) throw new Error('同步进度写入失败');
+    return matched;
+  }
+
+  persistStateChecked() {
+    return writeJsonFile(this.stateFile, this.state);
+  }
+
+  syncScope() {
+    return `${this.state.serverUrl}:${this.account?.userId || ''}`;
+  }
+
+  assertSyncScope(scope) {
+    if (scope !== this.syncScope()) throw new Error('同步期间账号或服务器已切换，请重新同步');
+  }
+
+  async runSyncCycle() {
+    this.state.verifiedAt = null;
+    if (!this.account || !this.api.getAuthenticated() || !this.isOnline()) {
+      this.state.lastError = !this.account || !this.api.getAuthenticated() ? '请先登录后同步' : '网络暂不可用';
+      this.persistState();
+      return false;
+    }
+    clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.state.lastError = null;
+    try {
+      if (this.pushPromise) await this.pushPromise;
+      if (fs.existsSync(this.eventStore.eventsFile)) {
+        const stored = JSON.parse(fs.readFileSync(this.eventStore.eventsFile, 'utf8'));
+        if (!Array.isArray(stored)) throw new Error('本地日程文件格式错误，请恢复备份后同步');
+      }
+      // Check old skipped records before uploading local-only records.
+      if (!this.state.calibrated) await this.reconcileSnapshot();
+      await this.pullAll();
+      for (let batch = 0; batch < 100 && this.queue.length; batch += 1) {
+        const operations = this.queue.map((entry) => entry.operationId).join(',');
+        await this.flushPush({ internal: true, force: true });
+        if (this.state.lastError) throw new Error(this.state.lastError);
+        if (operations === this.queue.map((entry) => entry.operationId).join(',')) break;
+      }
+      await this.pullAll();
+      const matched = await this.reconcileSnapshot();
+      if (!matched) this.state.lastError = this.state.conflicts.length ? '有同步冲突待处理' : '仍有本机变更待上传，尚未完成同步';
+      else {
+        this.state.lastError = null;
+        this.state.lastSyncAt = this.state.verifiedAt;
+      }
+      this.persistState();
+      return matched;
+    } catch (error) {
+      this.state.lastError = error.message || '同步失败';
+      this.state.verifiedAt = null;
+      this.persistState();
+      return false;
+    } finally {
+      this.scheduleNextRetry();
+    }
   }
 
   async heartbeat() {
