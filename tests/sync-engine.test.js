@@ -50,6 +50,7 @@ class FakeCloudApi {
       this.refreshToken = tokens.refresh_token || this.refreshToken;
     } else {
       this.bearerToken = null;
+      this.refreshToken = null;
     }
   }
 
@@ -461,6 +462,64 @@ test('resolving conflict with server adopts the cloud version', async () => {
     const stored = engine.__store.getAnyEvent(created.id);
     assert.equal(stored.event, '云端版本');
     assert.equal(stored._version, 3);
+  });
+});
+
+test('bulk local choice queues all reviewed versions and creates a backup', async () => {
+  await withEngine({}, async (engine) => {
+    const records = ['甲', '乙'].map((event) => engine.__store.addEvent({ event, date: '2026-10-03' }));
+    for (const record of records) engine.addConflict(record._uuid, record, { event: '云端', date: record.date }, 3);
+    const result = await engine.resolveConflicts('local', engine.listConflicts());
+    assert.equal(result.ok, true);
+    assert.equal(result.resolved, 2);
+    assert.equal(engine.queue.length, 2);
+    assert.ok(engine.queue.every((entry) => entry.baseVersion === 3 && entry.version === 4));
+    assert.equal(engine.listConflicts().length, 0);
+    assert.ok(fs.readdirSync(engine.__dataDir).some((name) => name.startsWith('conflict-resolution-backup-')));
+  });
+});
+
+test('bulk cloud choice adopts content and deletion without touching unrelated tasks', async () => {
+  await withEngine({}, async (engine) => {
+    const [first, deleted, unrelated] = ['甲', '乙', '无冲突'].map((event) => engine.__store.addEvent({ event, date: '2026-10-03' }));
+    engine.addConflict(first._uuid, first, { event: '云端甲', date: first.date }, 3);
+    engine.addConflict(deleted._uuid, deleted, null, 4);
+    const result = await engine.resolveConflicts('server', engine.listConflicts());
+    assert.equal(result.ok, true);
+    assert.equal(result.resolved, 2);
+    assert.equal(engine.__store.getAnyEvent(first.id).event, '云端甲');
+    assert.equal(engine.__store.getAnyEvent(deleted.id)._deleted, true);
+    assert.equal(engine.__store.getAnyEvent(unrelated.id).event, '无冲突');
+    assert.equal(engine.queue.length, 0);
+  });
+});
+
+test('bulk choice refuses stale reviewed data and reports partial failures accurately', async () => {
+  await withEngine({}, async (engine) => {
+    const [first, second] = ['甲', '乙'].map((event) => engine.__store.addEvent({ event, date: '2026-10-03' }));
+    for (const record of [first, second]) engine.addConflict(record._uuid, record, { event: '云端', date: record.date }, 3);
+    const stale = engine.listConflicts();
+    engine.state.conflicts[0].serverVersion = 4;
+    const rejected = await engine.resolveConflicts('server', stale);
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.resolved, 0);
+    assert.equal(engine.__store.getAnyEvent(first.id).event, '甲');
+    const original = engine.__store.applyRemoteEvent.bind(engine.__store);
+    engine.__store.applyRemoteEvent = (eventId, ...args) => eventId === second._uuid ? null : original(eventId, ...args);
+    const partial = await engine.resolveConflicts('server', engine.listConflicts());
+    assert.equal(partial.ok, false);
+    assert.equal(partial.resolved, 1);
+    assert.equal(engine.listConflicts().length, 1);
+    assert.equal(engine.__store.getAnyEvent(second.id).event, '乙');
+    await assert.rejects(engine.resolveConflict(second._uuid, 'invalid'), /请选择/);
+  });
+});
+
+test('cloud conflict can recreate a locally missing record', async () => {
+  await withEngine({}, async (engine) => {
+    engine.addConflict('missing-record', null, { event: '云端恢复', date: '2026-10-03' }, 2);
+    assert.equal(await engine.resolveConflict('missing-record', 'server'), true);
+    assert.equal(engine.__store.findEventByUuid('missing-record').event, '云端恢复');
   });
 });
 
@@ -1071,6 +1130,27 @@ test('server-rejected refresh clears credentials and signs out', async () => {
     assert.equal(engine.account, null);
     assert.equal(engine.__cleared.length, 1);
     assert.ok(engine.state.lastError.includes('登录已失效'));
+    assert.equal(engine.getSnapshot().reauthRequired, true);
+  } finally {
+    drainTimers(engine);
+    fs.rmSync(engine.__dataDir, { recursive: true, force: true });
+  }
+});
+
+test('expiry keeps pending changes and conflicts and requests login after restart', async () => {
+  const engine = engineWithCredential({ refreshToken: 'rt-dead' });
+  try {
+    engine.account = { userId: 'u1', email: 'a@b.c' };
+    engine.state.account = engine.account;
+    engine.queue = [{ operationId: 'pending', eventId: 'local-event' }];
+    engine.state.conflicts = [{ eventId: 'conflict-event' }];
+    await engine.expireSession();
+    await engine.expireSession();
+    assert.equal(engine.__cleared.length, 1);
+    assert.equal(engine.queue.length, 1);
+    assert.equal(engine.state.conflicts.length, 1);
+    assert.equal(engine.getSnapshot().reauthRequired, true);
+    assert.equal(JSON.parse(fs.readFileSync(engine.stateFile)).reauthRequired, true);
   } finally {
     drainTimers(engine);
     fs.rmSync(engine.__dataDir, { recursive: true, force: true });
@@ -1119,6 +1199,7 @@ test('explicit logout clears credentials, tokens and stops the session', async (
     assert.equal(engine.account.email, 'a@b.c');
     await engine.signOut();
     assert.equal(engine.account, null);
+    assert.equal(engine.getSnapshot().reauthRequired, false);
     assert.equal(engine.__cleared.length, 1);
     assert.equal(engine.__api.bearerToken, null);
     assert.equal(engine.getStatus(), SYNC_STATUS.SIGNED_OUT);

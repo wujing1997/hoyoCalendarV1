@@ -21,6 +21,40 @@ function jsonHandler(status, body) {
   };
 }
 
+test('concurrent expired access tokens share one proactive refresh', async () => {
+  let refreshes = 0;
+  const { server, port } = await startServer((req, res) => {
+    if (req.url === '/api/v1/auth/refresh') {
+      refreshes++;
+      setTimeout(() => jsonHandler(200, { access_token: 'new', refresh_token: 'rotated', expires_in: 900 })(req, res), 20);
+    } else {
+      assert.equal(req.headers.authorization, 'Bearer new');
+      jsonHandler(200, { email: 'a@b.c' })(req, res);
+    }
+  });
+  try {
+    const api = new CloudApi({ baseUrl: `http://127.0.0.1:${port}` });
+    api.setTokens({ access_token: 'old', refresh_token: 'old-refresh', expires_in: 1 });
+    await Promise.all([api.me(), api.me(), api.me()]);
+    assert.equal(refreshes, 1);
+    assert.equal(api.refreshToken, 'rotated');
+  } finally { server.close(); }
+});
+
+test('rejected renewal notifies expiry, while network failure retains credentials', async () => {
+  let expired = 0;
+  const api = new CloudApi({ onSessionExpired: () => { expired++; } });
+  api.setTokens({ access_token: 'old', refresh_token: 'rt', expires_in: 1 });
+  api.call = async () => { throw new Error('offline'); };
+  await assert.rejects(api.me(), /网络暂不可用/);
+  assert.equal(expired, 0);
+  assert.equal(api.refreshToken, 'rt');
+  api.call = async () => ({ ok: false, status: 401, data: { detail: 'expired' } });
+  await assert.rejects(api.me(), /登录已失效/);
+  assert.equal(expired, 1);
+  assert.equal(api.refreshToken, null);
+});
+
 test('parseBaseUrl normalizes host and scheme', () => {
   assert.deepEqual(parseBaseUrl('127.0.0.1:8000'), { origin: 'http://127.0.0.1:8000', isHttps: false });
   assert.deepEqual(parseBaseUrl('https://example.com'), { origin: 'https://example.com', isHttps: true });

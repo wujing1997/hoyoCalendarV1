@@ -1,6 +1,6 @@
 {
   "name": "hoyocalendar",
-  "version": "3.0.8",
+  "version": "3.0.10",
   "description": "面向效率工作的本地优先桌面日程与任务管理工具",
   "main": "main.js",
   "scripts": {
@@ -24,7 +24,7 @@
   "type": "commonjs",
   "build": {
     "appId": "com.hoyocalendar.app",
-    "productName": "HoYoCalendarV3.0.8",
+    "productName": "HoYoCalendarV3.0.10",
     "directories": {
       "output": "dist"
     },
@@ -63,7 +63,7 @@
       "oneClick": true,
       "perMachine": false,
       "allowToChangeInstallationDirectory": false,
-      "artifactName": "HoYoCalendarV3.0.8-setup.exe",
+      "artifactName": "HoYoCalendarV3.0.10-setup.exe",
       "shortcutName": "HoYoCalendar"
     }
   },

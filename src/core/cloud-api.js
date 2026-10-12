@@ -101,6 +101,8 @@ class CloudApi {
     this.timeoutMs = options.timeoutMs || 45000;
     this.request = options.request || request;
     this.onRefreshToken = options.onRefreshToken || null;
+    this.onSessionExpired = options.onSessionExpired || null;
+    this.refreshPromise = null;
     this.bearerToken = null;
     this.refreshToken = null;
     this.deviceId = null;
@@ -149,17 +151,36 @@ class CloudApi {
   }
 
   async authCall(path, options = {}) {
+    if (this.tokenExpired() && this.refreshToken) {
+      const refreshed = await this.refreshSession();
+      if (!refreshed.ok) {
+        if (!refreshed.invalid) throw new CloudApiError('网络暂不可用，登录状态已保留', 0, null, 'refresh_unavailable');
+        throw new CloudApiError('登录已失效，请重新登录', 401, null, 'session_expired');
+      }
+    }
     let response = await this.call(path, options);
     if (response.status === 401 && options.retried !== true && this.refreshToken) {
       const refreshed = await this.refreshSession();
       if (refreshed && refreshed.ok) {
         response = await this.call(path, { ...options, retried: true });
+      } else if (!refreshed.invalid) {
+        throw new CloudApiError('网络暂不可用，登录状态已保留', 0, null, 'refresh_unavailable');
       }
+    }
+    if (response.status === 401 && this.bearerToken) {
+      this.setTokens(null);
+      if (this.onSessionExpired) await this.onSessionExpired();
     }
     return response;
   }
 
-  async refreshSession() {
+  refreshSession() {
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.performRefresh().finally(() => { this.refreshPromise = null; });
+    return this.refreshPromise;
+  }
+
+  async performRefresh() {
     if (!this.refreshToken) return { ok: false, invalid: false, reason: 'no_token' };
     try {
       const response = await this.call('/api/v1/auth/refresh', {
@@ -176,6 +197,10 @@ class CloudApi {
         return { ok: true, invalid: false };
       }
       const invalid = response.status === 400 || response.status === 401 || response.status === 403;
+      if (invalid) {
+        this.setTokens(null);
+        if (this.onSessionExpired) await this.onSessionExpired();
+      }
       return {
         ok: false,
         invalid,

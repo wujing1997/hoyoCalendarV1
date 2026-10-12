@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { LocalConfig } = require('./src/core/local-config');
+const { RememberedLogin } = require('./src/core/remembered-login');
 const { startReminders } = require('./src/reminder/controller');
 
 const allowMultipleInstances = process.env.HOYO_ALLOW_MULTIPLE_INSTANCES === '1';
@@ -361,6 +362,13 @@ ipcMain.handle('set-auto-launch', (_event, enabled) => {
 });
 
 const credentialFile = path.join(app.getPath('userData'), 'cloud-credentials.bin');
+const rememberedLogin = new RememberedLogin(path.join(app.getPath('userData'), 'remembered-login.bin'), safeStorage);
+ipcMain.handle('cloud-remembered-login-get', (_event, serverUrl) => rememberedLogin.get(serverUrl));
+ipcMain.handle('cloud-remembered-login-save', (_event, { serverUrl, email, password }) => {
+  try { rememberedLogin.save(serverUrl, email, password); return { ok: true }; }
+  catch (_) { return { ok: false, message: '无法加密保存密码，登录成功但未记住密码' }; }
+});
+ipcMain.handle('cloud-remembered-login-clear', () => { rememberedLogin.clear(); return true; });
 
 function credentialStorageAvailable() {
   try {

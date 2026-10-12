@@ -6,6 +6,7 @@ const { EventStore } = require('./src/core/event-store');
 const { CommandRouter } = require('./src/core/command-router');
 const { CloudApi, CloudApiError, DEFAULT_SERVER_URL, migrateLegacyServerUrl } = require('./src/core/cloud-api');
 const { SyncEngine } = require('./src/core/sync-engine');
+const { conflictDetails } = require('./src/core/conflict-details');
 
 let Lunar;
 let Solar;
@@ -51,6 +52,7 @@ const cloudApi = new CloudApi({
   baseUrl: DEFAULT_SERVER_URL,
   timeoutMs: 45000,
   onRefreshToken: (token) => credentialStore.setRefreshToken(token),
+  onSessionExpired: () => syncEngine.expireSession(),
 });
 
 const syncEngine = new SyncEngine({
@@ -302,10 +304,21 @@ contextBridge.exposeInMainWorld('cloudAPI', {
 
   restoreSession: () => syncEngine.restoreSession(),
 
+  getRememberedLogin: () => ipcRenderer.invoke('cloud-remembered-login-get', syncEngine.getSnapshot().serverUrl),
+  clearRememberedLogin: () => ipcRenderer.invoke('cloud-remembered-login-clear'),
+
   login: async (credentials) => {
     try {
       const deviceName = await ipcRenderer.invoke('cloud-device-name').catch(() => '未知设备');
-      await syncEngine.login({ ...credentials, deviceName });
+      const activated = await syncEngine.login({ ...credentials, deviceName });
+      if (!activated) return { ok: false, message: syncEngine.getSnapshot().lastError || '登录未完成，请重试' };
+      if (credentials.rememberPassword) {
+        const stored = await ipcRenderer.invoke('cloud-remembered-login-save', {
+          serverUrl: syncEngine.getSnapshot().serverUrl, email: credentials.email, password: credentials.password,
+        });
+        return { ok: true, warning: stored.ok ? null : stored.message };
+      }
+      await ipcRenderer.invoke('cloud-remembered-login-clear');
       return { ok: true };
     } catch (error) {
       return { ok: false, message: friendlyCloudError(error) };
@@ -315,7 +328,8 @@ contextBridge.exposeInMainWorld('cloudAPI', {
   register: async (credentials) => {
     try {
       const deviceName = await ipcRenderer.invoke('cloud-device-name').catch(() => '未知设备');
-      await syncEngine.register({ ...credentials, deviceName });
+      const activated = await syncEngine.register({ ...credentials, deviceName });
+      if (!activated) return { ok: false, message: syncEngine.getSnapshot().lastError || '登录未完成，请重试' };
       return { ok: true };
     } catch (error) {
       return { ok: false, message: friendlyCloudError(error) };
@@ -364,11 +378,14 @@ contextBridge.exposeInMainWorld('cloudAPI', {
   restoreFromTrash: (id, eventId) => syncEngine.restoreFromTrash(id, eventId),
   purgeTrash: () => syncEngine.purgeExpiredTrash(),
 
-  getConflicts: () => syncEngine.listConflicts(),
+  getConflicts: () => syncEngine.listConflicts().map((conflict) => ({ ...conflict, details: conflictDetails(conflict) })),
   resolveConflict: async (eventId, choice) => {
-    await syncEngine.resolveConflict(eventId, choice);
-    return { ok: true };
+    try {
+      const ok = await syncEngine.resolveConflict(eventId, choice);
+      return { ok, message: ok ? null : '该冲突已变化，请刷新后重试' };
+    } catch (error) { return { ok: false, message: error.message || '冲突处理失败' }; }
   },
+  resolveConflicts: (choice, conflicts) => syncEngine.resolveConflicts(choice, conflicts.map(({ details, ...conflict }) => conflict)),
 
   agentPlan: async (message) => {
     try {

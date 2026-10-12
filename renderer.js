@@ -1694,6 +1694,7 @@
 
     if (!account) {
       container.innerHTML = `
+        ${snapshot?.reauthRequired ? '<p class="account-error" role="alert">登录已失效，请重新登录；本地日程和待同步修改已保留。</p>' : ''}
         <div class="account-tabs">
           <button class="account-tab active" data-account-tab="login">登录</button>
           <button class="account-tab" data-account-tab="register">邀请码注册</button>
@@ -1706,6 +1707,9 @@
           <label class="settings-field">
             <span>密码</span>
             <input type="password" name="password" autocomplete="current-password" required>
+          </label>
+          <label class="remember-password-option">
+            <input type="checkbox" name="rememberPassword"><span>记住密码（仅保存在这台电脑）</span>
           </label>
           <p class="account-error" id="accountError" hidden></p>
           <button class="primary-button" type="submit">登录</button>
@@ -1728,10 +1732,20 @@
         </form>
         ${renderCloudServerSection(snapshot)}
       `;
+      const loginForm = $('#loginForm');
+      let edited = false;
+      loginForm.addEventListener('input', () => { edited = true; }, { once: true });
+      const remembered = await window.cloudAPI.getRememberedLogin().catch(() => null);
+      if (remembered && loginForm.isConnected && !edited) {
+        loginForm.elements.email.value = remembered.email;
+        loginForm.elements.password.value = remembered.password;
+        loginForm.elements.rememberPassword.checked = true;
+      }
       return;
     }
 
     const sessionsResult = await window.cloudAPI.getSessions();
+    if (state.cloudAccount !== account) return;
     const sessions = sessionsResult.ok ? sessionsResult.sessions : [];
     container.innerHTML = `
       <section class="account-section">
@@ -1821,7 +1835,7 @@
     submitButton.textContent = '处理中…';
     try {
       const result = form.id === 'loginForm'
-        ? await window.cloudAPI.login({ email: formData.email, password: formData.password })
+        ? await window.cloudAPI.login({ email: formData.email, password: formData.password, rememberPassword: formData.rememberPassword === 'on' })
         : await window.cloudAPI.register({
           inviteCode: formData.inviteCode,
           email: formData.email,
@@ -1832,7 +1846,7 @@
         errorElement.hidden = false;
         return;
       }
-      showToast(form.id === 'loginForm' ? '登录成功' : '注册成功');
+      showToast(result.warning || (form.id === 'loginForm' ? '登录成功' : '注册成功'));
       await renderAccount();
     } finally {
       submitButton.disabled = false;
@@ -1849,32 +1863,42 @@
     openOverlay('conflictOverlay');
   }
 
+  let renderedConflicts = [];
   function renderConflicts() {
     const conflicts = window.cloudAPI.getConflicts() || [];
+    renderedConflicts = conflicts;
     const container = $('#conflictContent');
     if (!conflicts.length) {
       container.innerHTML = '<div class="detail-empty">没有待处理的冲突</div>';
       return;
     }
-    container.innerHTML = conflicts.map((conflict) => {
+    container.innerHTML = `<section class="conflict-bulk-toolbar">
+      <strong>${conflicts.length} 项冲突待处理</strong>
+      <p>高亮行表示差异。批量选择只处理这些冲突，不覆盖其他日程；以本地为准会上传本地版本，以云端为准会替换对应的本地版本（包括删除状态）。</p>
+      <div class="conflict-actions">
+        <button class="secondary-button" data-conflict-bulk="local">全部以本地为准</button>
+        <button class="primary-button" data-conflict-bulk="server">全部以云端为准</button>
+      </div>
+      <div id="conflictBulkConfirmation" hidden></div>
+    </section>` + conflicts.map((conflict) => {
       const local = conflict.local || {};
       const server = conflict.server || {};
       return `
         <article class="conflict-card" data-conflict-id="${escapeHtml(conflict.eventId)}">
           <div class="conflict-title">${escapeHtml(local.event || server.event || '日程冲突')}</div>
-          <div class="conflict-versions">
-            <div class="conflict-version">
-              <span class="conflict-version-tag local">本机版本</span>
-              ${renderConflictEvent(local)}
-            </div>
-            <div class="conflict-version">
-              <span class="conflict-version-tag server">云端版本</span>
-              ${renderConflictEvent(server)}
-            </div>
-          </div>
+          <p class="conflict-summary">${conflict.details.differenceCount ? `差异：${escapeHtml(conflict.details.changedLabels.join('、'))}` : '任务内容相同，冲突来自同步版本或修改记录不同。'}</p>
+          <small class="conflict-meta">本地版本 ${Number(conflict.localVersion) || 0} · 云端版本 ${Number(conflict.serverVersion) || 0} · 检测时间 ${escapeHtml(safeFormatDate(conflict.at, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }))}</small>
+          <div class="conflict-table-wrap"><table class="conflict-comparison">
+            <thead><tr><th scope="col">字段</th><th scope="col">本地</th><th scope="col">云端</th></tr></thead>
+            <tbody>${conflict.details.rows.filter((row) => row.different).map(renderConflictRow).join('')}</tbody>
+          </table></div>
+          <details class="conflict-full-details"><summary>查看完整日程信息与修改记录</summary>
+            <div class="conflict-table-wrap"><table class="conflict-comparison"><thead><tr><th scope="col">字段</th><th scope="col">本地</th><th scope="col">云端</th></tr></thead>
+            <tbody>${conflict.details.rows.map(renderConflictRow).join('')}</tbody></table></div>
+          </details>
           <div class="conflict-actions">
-            <button class="secondary-button" data-conflict-choice="local">保留本机</button>
-            <button class="primary-button" data-conflict-choice="server">采用云端</button>
+            <button class="secondary-button" data-conflict-choice="local">此项以本地为准</button>
+            <button class="primary-button" data-conflict-choice="server">此项以云端为准</button>
           </div>
         </article>
       `;
@@ -1882,23 +1906,47 @@
     refreshIcons();
   }
 
-  function renderConflictEvent(event) {
-    if (!event || !Object.keys(event).length) {
-      return '<div class="detail-empty">（已删除）</div>';
+  function renderConflictRow(row) {
+    return `<tr class="${row.different ? 'conflict-different' : ''}"><th scope="row">${escapeHtml(row.label)}${row.different ? '<span class="conflict-diff-label">不同</span>' : ''}</th><td>${escapeHtml(row.local)}</td><td>${escapeHtml(row.server)}</td></tr>`;
+  }
+
+  let pendingConflictBatch = null;
+  let resolvingConflicts = false;
+  async function handleConflictBulk(button) {
+    if (resolvingConflicts) return;
+    const confirmation = $('#conflictBulkConfirmation');
+    if (button.dataset.conflictBulk === 'cancel') {
+      pendingConflictBatch = null;
+      confirmation.hidden = true;
+      return;
     }
-    const parts = [];
-    if (event.event) parts.push(`<strong>${escapeHtml(event.event)}</strong>`);
-    const meta = [];
-    if (event.date) meta.push(`日期 ${escapeHtml(event.date)}`);
-    if (event.time) meta.push(`时间 ${escapeHtml(event.time)}`);
-    if (event.isDeadline) meta.push('Deadline');
-    if (event.isRecurring) meta.push('重复任务');
-    if (event.location) meta.push(`地点 ${escapeHtml(event.location)}`);
-    if (event.note) meta.push(`备注 ${escapeHtml(event.note)}`);
-    return `<div class="conflict-event">${parts.join('')}${meta.length ? `<div class="conflict-meta">${meta.map(escapeHtml).join(' · ')}</div>` : ''}</div>`;
+    if (button.dataset.conflictBulk !== 'confirm') {
+      pendingConflictBatch = { choice: button.dataset.conflictBulk, conflicts: renderedConflicts };
+      const label = pendingConflictBatch.choice === 'local' ? '本地' : '云端';
+      confirmation.innerHTML = `<p>确认将这 ${pendingConflictBatch.conflicts.length} 项冲突全部以${label}为准？另一侧的冲突版本将被替换，已删除的记录也按所选版本处理。操作前会自动备份本地数据。</p><div class="conflict-actions"><button class="secondary-button" data-conflict-bulk="cancel">取消</button><button class="primary-button" data-conflict-bulk="confirm">确认全部以${label}为准</button></div>`;
+      confirmation.hidden = false;
+      confirmation.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if (!pendingConflictBatch) return;
+    resolvingConflicts = true;
+    $('#conflictContent').querySelectorAll('button').forEach((item) => { item.disabled = true; });
+    try {
+      const result = await window.cloudAPI.resolveConflicts(pendingConflictBatch.choice, pendingConflictBatch.conflicts);
+      showToast(result.ok ? `已处理 ${result.resolved} 项冲突${pendingConflictBatch.choice === 'local' ? '，等待上传同步' : ''}` : result.message || '批量处理失败');
+      renderAll();
+      renderConflicts();
+      if (!window.cloudAPI.getConflicts().length) closeOverlay('conflictOverlay');
+    } catch { showToast('批量处理失败，请重试'); }
+    finally {
+      resolvingConflicts = false;
+      pendingConflictBatch = null;
+      $('#conflictContent').querySelectorAll('button').forEach((item) => { item.disabled = false; });
+    }
   }
 
   async function handleConflictChoice(button) {
+    if (resolvingConflicts) return;
     const card = button.closest('[data-conflict-id]');
     if (!card) return;
     const eventId = card.dataset.conflictId;
@@ -2063,7 +2111,7 @@
     $('#windowModeSelect').value = state.windowState.mode || 'wide';
     $('#autoLaunchToggle').checked = Boolean(await window.electronAPI?.getAutoLaunch());
     const version = await window.electronAPI?.getAppVersion();
-    $('#appVersion').textContent = `V${version || '3.0.8'}`;
+    $('#appVersion').textContent = `V${version || '3.0.10'}`;
     openOverlay('settingsOverlay');
   }
 
@@ -2323,7 +2371,15 @@
       }
     });
     $('#accountContent').addEventListener('submit', handleAccountForm);
+    $('#accountContent').addEventListener('change', async (event) => {
+      if (event.target.name === 'rememberPassword' && !event.target.checked) {
+        try { await window.cloudAPI.clearRememberedLogin(); }
+        catch { showToast('未能清除记住的密码，请重试'); }
+      }
+    });
     $('#conflictContent').addEventListener('click', (event) => {
+      const bulkButton = event.target.closest('[data-conflict-bulk]');
+      if (bulkButton) { handleConflictBulk(bulkButton); return; }
       const button = event.target.closest('[data-conflict-choice]');
       if (button) handleConflictChoice(button);
     });
@@ -2517,13 +2573,21 @@
       state.cloudState = window.cloudAPI.getState();
       state.cloudAccount = state.cloudState?.account || null;
       renderSyncStatus();
+      if (state.cloudState?.reauthRequired) {
+        showToast('登录已失效，请重新登录');
+        openAccount();
+      }
       window.cloudAPI.subscribeState((snapshot) => {
         const previousDataRevision = Number(state.cloudState?.dataRevision || 0);
+        const previousState = state.cloudState;
         state.cloudState = snapshot;
         state.cloudAccount = snapshot.account || null;
         renderSyncStatus();
         if (Number(snapshot.dataRevision || 0) !== previousDataRevision) renderAll();
-        if ($('#accountOverlay').classList.contains('open')) renderAccount();
+        if (snapshot.reauthRequired && !previousState?.reauthRequired) {
+          showToast('登录已失效，请重新登录');
+          openAccount();
+        } else if ($('#accountOverlay').classList.contains('open') && (snapshot.account || previousState?.account)) renderAccount();
         if (snapshot.status === 'synced') refreshTrashCount();
       });
       window.cloudAPI.subscribeAccount((account) => {

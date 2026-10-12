@@ -215,6 +215,7 @@ class SyncEngine {
       migrationDone: this.state.migrationDone,
       dataRevision: this.dataRevision,
       verifiedAt: this.state.verifiedAt || null,
+      reauthRequired: Boolean(this.state.reauthRequired),
       verifiedCursor: this.state.verifiedCursor ?? null,
     };
   }
@@ -243,10 +244,7 @@ class SyncEngine {
     const refreshToken = await this.credentialStore.getRefreshToken();
     if (!refreshToken) {
       if (this.account) {
-        this.account = null;
-        this.state.account = null;
-        this.state.lastError = null;
-        this.persistState();
+        await this.expireSession();
       }
       this.notify();
       return false;
@@ -257,13 +255,7 @@ class SyncEngine {
       return this.activateSession({ notify: false });
     }
     if (refreshed && refreshed.invalid) {
-      await this.credentialStore.clearRefreshToken();
-      this.api.setTokens(null);
-      this.account = null;
-      this.state.account = null;
-      this.state.lastError = refreshed.message || '登录已失效，请重新登录';
-      this.persistState();
-      this.notify();
+      await this.expireSession();
       return false;
     }
     this.state.lastError = '网络暂不可用，登录态已保留，恢复网络后自动同步';
@@ -279,20 +271,20 @@ class SyncEngine {
       this.account = { userId: profile.id, email: profile.email, status: profile.status };
       if (previousUserId && previousUserId !== profile.id) this.resetAgentSession();
       this.state.account = this.account;
+      this.state.reauthRequired = false;
       this.state.lastError = null;
       this.persistState();
       if (options.notify !== false) this.onAccountChange(this.getAccount());
       if (options.sync !== false) {
         await this.initialSync();
       }
+      if (!this.account || this.state.reauthRequired) return false;
       this.startHeartbeat();
       this.notify();
       return true;
     } catch (error) {
-      if (error instanceof CloudApiError && error.status === 401) {
-        await this.signOut();
-      } else if (error instanceof CloudApiError && error.status === 403) {
-        this.onAccountChange(null);
+      if (error instanceof CloudApiError && (error.status === 401 || error.status === 403)) {
+        await this.expireSession();
       }
       this.state.lastError = error.message || '登录后同步失败';
       this.persistState();
@@ -322,6 +314,7 @@ class SyncEngine {
     this.api.setTokens(null);
     this.account = null;
     this.state.account = null;
+    this.state.reauthRequired = false;
     this.state.conflicts = [];
     this.state.lastError = null;
     this.state.migrationSummary = null;
@@ -329,6 +322,21 @@ class SyncEngine {
     this.persistState();
     if (hadAccount) this.onAccountChange(null);
     this.stopHeartbeat();
+    this.notify();
+  }
+
+  async expireSession() {
+    if (this.state.reauthRequired && !this.account && !this.api.bearerToken && !this.api.refreshToken) return;
+    this.api.setTokens(null);
+    await this.credentialStore.clearRefreshToken();
+    this.account = null;
+    this.state.account = null;
+    this.state.reauthRequired = true;
+    this.state.verifiedAt = null;
+    this.state.lastError = '登录已失效，请重新登录；本地日程和待同步修改已保留';
+    this.stopHeartbeat();
+    this.persistState();
+    this.onAccountChange(null);
     this.notify();
   }
 
@@ -686,6 +694,8 @@ class SyncEngine {
       eventId,
       localId: local?.id || null,
       local: local ? this.eventStore.sanitizeForSync(local) : null,
+      localDeleted: Boolean(local?._deleted),
+      localVersion: Number(local?._version) || 0,
       server: serverData || null,
       serverVersion: Number(serverVersion) || 0,
       at: new Date().toISOString(),
@@ -697,19 +707,19 @@ class SyncEngine {
   }
 
   async resolveConflict(eventId, choice) {
+    if (!['local', 'server'].includes(choice)) throw new Error('请选择以本地或云端为准');
     const conflict = this.state.conflicts.find((item) => item.eventId === eventId);
     if (!conflict) return false;
     const local = this.eventStore.findEventByUuid(eventId);
+    if (choice === 'local' && !local) throw new Error('本地记录已不存在，请刷新冲突信息');
     if (choice === 'server') {
       if (conflict.server) {
-        if (local) {
-          if (!this.eventStore.applyRemoteEvent(
-            eventId,
-            conflict.server,
-            conflict.serverVersion,
-            this.eventStore.generateUuid(),
-          )) throw new Error('冲突处理写入失败');
-        }
+        if (!this.eventStore.applyRemoteEvent(
+          eventId,
+          conflict.server,
+          conflict.serverVersion,
+          this.eventStore.generateUuid(),
+        )) throw new Error('冲突处理写入失败');
       } else if (local) {
         const trashUntil = new Date();
         trashUntil.setDate(trashUntil.getDate() + TRASH_RETENTION_DAYS);
@@ -722,7 +732,7 @@ class SyncEngine {
         if (!this.eventStore.saveEvents(events)) throw new Error('冲突处理写入失败');
       }
       this.queue = this.queue.filter((entry) => entry.eventId !== eventId);
-      this.persistQueue();
+      if (!this.persistQueue()) throw new Error('冲突处理队列写入失败');
     } else if (choice === 'local' && local) {
       const next = clone(local);
       next._baseVersion = conflict.serverVersion;
@@ -734,19 +744,55 @@ class SyncEngine {
         events[index] = next;
         if (!this.eventStore.saveEvents(events)) throw new Error('冲突处理写入失败');
         this.enqueueChange(eventId, next._opId, next._deleted ? 'delete' : 'upsert', next);
+        if (!this.persistQueue()) throw new Error('冲突处理队列写入失败');
       }
     }
+    const previousConflicts = this.state.conflicts;
     this.state.conflicts = this.state.conflicts.filter((item) => item.eventId !== eventId);
     this.state.verifiedAt = null;
-    this.persistState();
+    if (!writeJsonFile(this.stateFile, this.state)) {
+      this.state.conflicts = previousConflicts;
+      throw new Error('冲突确认记录写入失败，请重试');
+    }
     this.dataRevision += 1;
     this.notify();
     this.schedulePush();
     return true;
   }
 
+  async resolveConflicts(choice, selection) {
+    if (!['local', 'server'].includes(choice) || !Array.isArray(selection) || !selection.length) {
+      return { ok: false, resolved: 0, message: '请选择需要处理的冲突和处理方式' };
+    }
+    // Wait for any current pull/push before accepting the versions the user reviewed.
+    if (this.cyclePromise) await this.cyclePromise;
+    const selected = new Map(selection.map((item) => [item.eventId, item]));
+    const current = this.listConflicts();
+    const conflicts = [...selected.values()].map((item) => current.find((entry) => entry.eventId === item.eventId));
+    if (conflicts.some((entry, index) => !entry || canonical(entry) !== canonical([...selected.values()][index]))) {
+      return { ok: false, resolved: 0, message: '冲突信息已更新，请查看最新差异后重试' };
+    }
+    const backup = path.join(this.dataDir, `conflict-resolution-backup-${Date.now()}.json`);
+    if (!writeJsonFile(backup, { choice, events: this.eventStore.loadAllEvents(), queue: this.queue, state: this.state })) {
+      return { ok: false, resolved: 0, message: '无法备份本地数据，未执行批量处理' };
+    }
+    let resolved = 0;
+    try {
+      for (const conflict of conflicts) {
+        if (await this.resolveConflict(conflict.eventId, choice)) resolved++;
+      }
+      return { ok: true, resolved, remaining: this.state.conflicts.length };
+    } catch (error) {
+      return { ok: false, resolved, remaining: this.state.conflicts.length, message: `已处理 ${resolved} 项，其余冲突保留：${error.message}` };
+    }
+  }
+
   listConflicts() {
-    return clone(this.state.conflicts);
+    return clone(this.state.conflicts.map((entry) => {
+      const local = this.eventStore.findEventByUuid(entry.eventId);
+      return { ...entry, local: local ? this.eventStore.sanitizeForSync(local) : null,
+        localDeleted: Boolean(local?._deleted), localVersion: Number(local?._version) || 0 };
+    }));
   }
 
   // ------------------------------------------------------------------ trash
@@ -1089,7 +1135,7 @@ class SyncEngine {
       const refreshed = await this.api.refreshSession();
       if (!refreshed || !refreshed.ok) {
         if (refreshed && refreshed.invalid) {
-          await this.signOut();
+          await this.expireSession();
         } else {
           this.notify();
         }

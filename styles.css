@@ -2876,6 +2876,20 @@ body[data-theme="dark"] .month-day.today .month-day-number {
   margin-bottom: 10px;
 }
 
+.conflict-bulk-toolbar { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.conflict-bulk-toolbar p, .conflict-summary { margin: 8px 0; font-size: 13px; line-height: 1.6; color: var(--text-soft); }
+#conflictBulkConfirmation { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--border); }
+.conflict-table-wrap { width: 100%; overflow-x: auto; margin-top: 10px; }
+.conflict-comparison { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+.conflict-comparison th, .conflict-comparison td { padding: 8px; vertical-align: top; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; border-bottom: 1px solid var(--border); }
+.conflict-comparison th:first-child { width: 25%; }
+.conflict-comparison thead { color: var(--text-soft); }
+.conflict-different { background: var(--primary-soft); }
+.conflict-diff-label { display: block; font-size: 10px; font-weight: normal; color: var(--primary); margin-top: 4px; }
+.conflict-full-details { margin-top: 12px; }
+.conflict-full-details summary { cursor: pointer; color: var(--text-soft); font-size: 12px; min-height: 32px; display: list-item; }
+.conflict-bulk-toolbar .conflict-actions { flex-wrap: wrap; }
+
 .conflict-versions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -3142,3 +3156,12 @@ body[data-theme="dark"] .month-day.today .month-day-number {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+.remember-password-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.remember-password-option input { width: 16px; height: 16px; margin: 0; accent-color: #3273d9; }
