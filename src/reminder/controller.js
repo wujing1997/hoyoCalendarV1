@@ -3,6 +3,8 @@ const { BrowserWindow, Tray, Menu, screen, powerMonitor, ipcMain } = require('el
 const path = require('path');
 const { EventStore } = require('../core/event-store');
 const { ReminderScheduler } = require('../core/reminder-scheduler');
+const { LocalConfig } = require('../core/local-config');
+const { BarkPush } = require('../core/bark-push');
 
 function startReminders({ app, getMainWindow, showCalendar, onError }) {
   let theme = 'light';
@@ -41,6 +43,8 @@ function startReminders({ app, getMainWindow, showCalendar, onError }) {
   }
   const dataDir = path.join(process.env.APPDATA || process.env.HOME, 'HoyoCalendar');
   const scheduler = new ReminderScheduler({ store: new EventStore({ dataDir }), stateFile: path.join(dataDir, 'reminder-confirmations.json'), onChange: publish });
+  const config = new LocalConfig(path.join(dataDir, 'config.json'));
+  const mobilePush = new BarkPush({ stateFile: path.join(dataDir, 'bark-deliveries.json'), getConfig: () => config.load().notifications?.bark, onError });
   const handlers = {
     'reminder-ready': (event) => {
       if (event.sender !== window.webContents) return;
@@ -60,7 +64,7 @@ function startReminders({ app, getMainWindow, showCalendar, onError }) {
     return scheduler.acknowledge(key);
   });
   window.loadFile(path.join(__dirname, 'index.html'));
-  const tick = () => { try { scheduler.tick(); } catch (error) { onError(error); } };
+  const tick = () => { try { scheduler.tick(); mobilePush.tick(scheduler.dueReminders || []); } catch (error) { onError(error); } };
   tick();
   const timer = setInterval(tick, 1000);
   powerMonitor.on('resume', tick);
@@ -70,6 +74,7 @@ function startReminders({ app, getMainWindow, showCalendar, onError }) {
   return {
     dispose() {
       clearInterval(timer);
+      mobilePush.dispose();
       powerMonitor.removeListener('resume', tick);
       powerMonitor.removeListener('unlock-screen', tick);
       displayEvents.forEach((event) => screen.removeListener(event, position));

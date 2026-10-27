@@ -84,3 +84,19 @@ test('wake catches up today only and a recurring task reminds again the next day
   assert.equal(f.scheduler.queue.length, 1);
   assert.equal(f.scheduler.snapshot().reminder.date, '2026-09-06');
 });
+
+test('reminders use the occurrence override time and skip skipped days', (t) => {
+  const f = fixture(t);
+  const daily = { isRecurring: true, recurringType: 'daily', startDate: '2026-09-01', date: '2026-09-01' };
+  f.setEvents([
+    event('moved', { ...daily, time: '08:00', occurrenceOverrides: { '2026-09-05': { time: '10:00', event: '晚点上班' } } }),
+    event('skipped', { ...daily, time: '08:30', skippedDates: ['2026-09-05'] }),
+  ]);
+  f.scheduler.tick();
+  assert.equal(f.scheduler.snapshot().reminder, null);
+  f.setTime(new Date(2026, 8, 5, 10, 0));
+  f.scheduler.tick();
+  assert.equal(f.scheduler.snapshot().reminder.title, '晚点上班');
+  assert.equal(f.scheduler.snapshot().reminder.time, '10:00');
+  assert.equal(f.scheduler.snapshot().remaining, 0);
+});

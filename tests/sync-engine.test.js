@@ -805,6 +805,35 @@ test('partial approval only applies selected actions', () => {
   });
 });
 
+test('choice group approval applies one option and rejects its siblings', () => {
+  withEngine({}, (engine) => {
+    engine.account = { userId: 'u1', email: 'a@b.c' };
+    engine.state.account = engine.account;
+    engine.lastAgentPlan = { planId: 'plan-c', actions: [] };
+    const actions = ['不设时间', '今天 18:30', '每天重复'].map((label, index) => ({
+      type: 'create',
+      draft_id: `draft-${index}`,
+      choice_group_id: 'choice-1',
+      option_label: label,
+      event: { event: '吃晚饭', date: '2026-08-01', time: index ? '18:30' : '' },
+    }));
+
+    const invalid = engine.approveActions(actions, new Set([0, 1]), 'plan-c');
+    assert.equal(invalid[0].type, 'invalid_choice');
+    assert.equal(engine.__store.loadEvents().length, 0);
+    assert.deepEqual(engine.agentReceipts, []);
+
+    const results = engine.approveActions(actions, new Set([1]), 'plan-c');
+    assert.equal(results.length, 1);
+    assert.equal(results[0].success, true);
+    assert.equal(engine.__store.loadEvents()[0].time, '18:30');
+    assert.deepEqual(
+      engine.agentReceipts.map((receipt) => [receipt.draft_id, receipt.status]),
+      [['draft-0', 'rejected'], ['draft-1', 'approved'], ['draft-2', 'rejected']],
+    );
+  });
+});
+
 test('approval maps snapshot UUID ids back to local ids', () => {
   withEngine({}, (engine) => {
     engine.account = { userId: 'u1', email: 'a@b.c' };

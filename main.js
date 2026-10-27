@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { LocalConfig } = require('./src/core/local-config');
+const { validateEndpoint } = require('./src/core/bark-push');
 const { RememberedLogin } = require('./src/core/remembered-login');
 const { startReminders } = require('./src/reminder/controller');
 
@@ -433,10 +434,18 @@ ipcMain.handle('config-load', () => localConfig.load());
 
 ipcMain.handle('config-save', (_event, updates) => {
   try {
+    if (updates?.notifications?.bark) {
+      const next = updates.notifications.bark;
+      const previous = localConfig.load().notifications?.bark;
+      if (next.endpoint) next.endpoint = validateEndpoint(next.endpoint);
+      if (next.enabled && !next.endpoint) throw new Error('请先填写手机推送地址');
+      next.enabledAt = next.enabled && (!previous?.enabled || previous.endpoint !== next.endpoint)
+        ? Date.now() : previous?.enabledAt || null;
+    }
     return { success: true, config: localConfig.save(updates) };
   } catch (error) {
     logError('Failed to save local config', error);
-    return { success: false };
+    return { success: false, message: updates?.notifications?.bark ? '手机推送设置无效，请检查推送地址' : '设置保存失败' };
   }
 });
 

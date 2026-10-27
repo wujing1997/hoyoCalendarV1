@@ -26,6 +26,28 @@ class AgentError(Exception):
         self.detail = detail
 
 
+_CREATE_EVENT_PROPERTIES = {
+    "event": {"type": "string", "description": "任务标题。"},
+    "date": {"type": "string", "description": "日期，格式 YYYY-MM-DD。"},
+    "time": {"type": "string", "description": "时间 HH:mm，可省略。"},
+    "location": {"type": "string"},
+    "note": {"type": "string"},
+    "urgency": {"type": "string", "enum": ["normal", "high"]},
+    "isDeadline": {"type": "boolean"},
+    "startDate": {"type": "string", "description": "Deadline 开始日 YYYY-MM-DD。"},
+    "deadlineDate": {"type": "string", "description": "Deadline 截止日 YYYY-MM-DD。"},
+    "isRecurring": {"type": "boolean"},
+    "recurringType": {"type": "string", "enum": ["daily", "weekly", "monthly"]},
+    "recurringDays": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}, "description": "每周重复的星期(0=周日…6=周六)，可多个。"},
+    "recurringMonthDays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 31}, "description": "每月重复的日期 1-31，可多个；短月份不存在的日期自动跳过。"},
+    "endDate": {"type": "string", "description": "重复结束日 YYYY-MM-DD，可省略。"},
+    "isLongTerm": {"type": "boolean", "description": "长期任务：自开始日起每天显示直到完成。"},
+    "targetDurationMinutes": {"type": "integer", "minimum": 1, "description": "专注目标时长(分钟)，可省略。"},
+}
+
+_OPTION_LABEL_MAX = 40
+_MAX_OPTIONS = 4
+
 TOOL_DEFINITIONS = {
     "list_events": {
         "type": "function",
@@ -54,25 +76,44 @@ TOOL_DEFINITIONS = {
             "description": "规划创建一条日程(普通 / Deadline / 每周或每月重复 / 长期任务)。动作由客户端审批后统一执行。日期一律使用 YYYY-MM-DD，时间使用 HH:mm。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "event": {"type": "string", "description": "任务标题。"},
-                    "date": {"type": "string", "description": "日期，格式 YYYY-MM-DD。"},
-                    "time": {"type": "string", "description": "时间 HH:mm，可省略。"},
-                    "location": {"type": "string"},
-                    "note": {"type": "string"},
-                    "urgency": {"type": "string", "enum": ["normal", "high"]},
-                    "isDeadline": {"type": "boolean"},
-                    "startDate": {"type": "string", "description": "Deadline 开始日 YYYY-MM-DD。"},
-                    "deadlineDate": {"type": "string", "description": "Deadline 截止日 YYYY-MM-DD。"},
-                    "isRecurring": {"type": "boolean"},
-                    "recurringType": {"type": "string", "enum": ["daily", "weekly", "monthly"]},
-                    "recurringDays": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}, "description": "每周重复的星期(0=周日…6=周六)，可多个。"},
-                    "recurringMonthDays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 31}, "description": "每月重复的日期 1-31，可多个；短月份不存在的日期自动跳过。"},
-                    "endDate": {"type": "string", "description": "重复结束日 YYYY-MM-DD，可省略。"},
-                    "isLongTerm": {"type": "boolean", "description": "长期任务：自开始日起每天显示直到完成。"},
-                    "targetDurationMinutes": {"type": "integer", "minimum": 1, "description": "专注目标时长(分钟)，可省略。"},
-                },
+                "properties": deepcopy(_CREATE_EVENT_PROPERTIES),
                 "required": ["event", "date"],
+            },
+        },
+    },
+    "propose_event_options": {
+        "type": "function",
+        "function": {
+            "name": "propose_event_options",
+            "description": (
+                "用户想新增日程但说法模棱两可（未说时间、是否重复等）时，规划 2-4 个互斥的候选创建方案，"
+                "由用户在客户端只选其一。例如“提醒我吃晚饭”：不设时间 / 推测一个时间 / 每天重复。"
+                "每个 option.event 的字段与 create_event 完全相同；任一方案无效则整组不生成。"
+                "不要对同一需求再额外调用 create_event。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "方案简短说明，如“每天 18:30 重复”。"},
+                                "event": {
+                                    "type": "object",
+                                    "description": "与 create_event 参数相同的日程字段。",
+                                    "properties": deepcopy(_CREATE_EVENT_PROPERTIES),
+                                    "required": ["event", "date"],
+                                },
+                            },
+                            "required": ["label", "event"],
+                        },
+                    },
+                },
+                "required": ["options"],
             },
         },
     },
@@ -80,7 +121,7 @@ TOOL_DEFINITIONS = {
         "type": "function",
         "function": {
             "name": "update_event",
-            "description": "规划修改已有日程。必须先 list_events 并使用其真实 ID。默认仅修改 effective_date（默认今天）及以后；跨边界任务由客户端保留历史并分割未来。支持全部日程类型及类型转换。",
+            "description": "规划修改已有日程。必须先 list_events 并使用其真实 ID。默认仅修改 effective_date（默认今天）及以后；跨边界任务由客户端保留历史并分割未来。支持全部日程类型及类型转换。只改循环/长期任务的某一天时用 scope=single，effective_date 为那一天，且只能改 event/time/location/note/urgency；对已跳过的那天单次修改会恢复该次。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -103,7 +144,7 @@ TOOL_DEFINITIONS = {
                     "endDate": {"type": ["string", "null"], "description": "循环结束日；null 表示无结束日期。"},
                     "isLongTerm": {"type": "boolean"},
                     "targetDurationMinutes": {"type": ["integer", "null"], "minimum": 0},
-                    "scope": {"type": "string", "enum": ["future", "all", "past"], "default": "future", "description": "future: effective_date 及以后；past: effective_date 及以前；all: 整条。"},
+                    "scope": {"type": "string", "enum": ["future", "all", "past", "single"], "default": "future", "description": "future: effective_date 及以后；past: effective_date 及以前；all: 整条；single: 仅 effective_date 当天这一次（其余日期不变）。"},
                     "effective_date": {"type": "string", "description": "范围边界 YYYY-MM-DD；省略时执行器强制使用请求 today。"},
                 },
                 "required": ["id"],
@@ -114,12 +155,12 @@ TOOL_DEFINITIONS = {
         "type": "function",
         "function": {
             "name": "delete_event",
-            "description": "规划删除已有日程。必须先 list_events 并使用其真实 ID。默认仅删除 effective_date（默认今天）及以后，跨边界系列保留历史。",
+            "description": "规划删除已有日程。必须先 list_events 并使用其真实 ID。默认仅删除 effective_date（默认今天）及以后，跨边界系列保留历史。只跳过循环/长期任务的某一天（如请假）用 scope=single。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "id": {"description": "日程 ID。"},
-                    "scope": {"type": "string", "enum": ["future", "all", "past"], "default": "future"},
+                    "scope": {"type": "string", "enum": ["future", "all", "past", "single"], "default": "future", "description": "single: 只跳过 effective_date 当天这一次。"},
                     "effective_date": {"type": "string", "description": "范围边界 YYYY-MM-DD；省略时使用请求 today。"},
                 },
                 "required": ["id"],
@@ -174,6 +215,17 @@ _EDITABLE_FIELDS = {
     "targetDurationMinutes",
 }
 
+# Fields a single occurrence (scope=single) may override; mirrors EventStore OCCURRENCE_FIELDS.
+_OCCURRENCE_FIELDS = {"event", "time", "location", "note", "urgency"}
+
+# Above this many days, a range check with skippedDates stops iterating day by day.
+_SKIP_SCAN_LIMIT_DAYS = 370
+
+
+def _skipped_dates(event: dict) -> set:
+    raw = event.get("skippedDates")
+    return {_clean_date(item) for item in raw} - {""} if isinstance(raw, list) else set()
+
 
 def _within_active_bounds(event: dict, date_key: str) -> bool:
     active_start = _clean_date(event.get("activeStartDate"))
@@ -183,6 +235,12 @@ def _within_active_bounds(event: dict, date_key: str) -> bool:
 
 def _event_occurs_on(event: dict, date_key: str) -> bool:
     """Mirror EventStore's local-date display rules without timezone conversion."""
+    if date_key in _skipped_dates(event):
+        return False
+    return _scheduled_ignoring_skips(event, date_key)
+
+
+def _scheduled_ignoring_skips(event: dict, date_key: str) -> bool:
     if not _within_active_bounds(event, date_key):
         return False
     if event.get("isLongTerm"):
@@ -216,6 +274,22 @@ def _event_occurs_on(event: dict, date_key: str) -> bool:
 
 
 def _event_occurs_between(event: dict, start: str, end: str) -> bool:
+    if not _occurs_between_ignoring_skips(event, start, end):
+        return False
+    if not _skipped_dates(event):
+        return True
+    cursor = datetime.strptime(start, "%Y-%m-%d")
+    boundary = datetime.strptime(end, "%Y-%m-%d")
+    if (boundary - cursor).days > _SKIP_SCAN_LIMIT_DAYS:
+        return True
+    while cursor <= boundary:
+        if _event_occurs_on(event, cursor.strftime("%Y-%m-%d")):
+            return True
+        cursor += timedelta(days=1)
+    return False
+
+
+def _occurs_between_ignoring_skips(event: dict, start: str, end: str) -> bool:
     active_start = _clean_date(event.get("activeStartDate"))
     active_end = _clean_date(event.get("activeEndDate"))
     effective_start = max(start, active_start) if active_start else start
@@ -275,6 +349,9 @@ def _list_window(args: dict):
     return None, None, None
 
 
+_DRAFT_META_KEYS = {"id", "_draft_status", "_choice_group_id", "_option_label"}
+
+
 class PlanningContext:
     def __init__(
         self,
@@ -294,6 +371,9 @@ class PlanningContext:
                 continue
             event["id"] = draft_id
             event["_draft_status"] = "pending_approval"
+            if draft.get("choice_group_id"):
+                event["_choice_group_id"] = str(draft["choice_group_id"])
+                event["_option_label"] = str(draft.get("option_label") or "")
             self.events.append(event)
 
     @staticmethod
@@ -301,8 +381,35 @@ class PlanningContext:
         return {
             key: value
             for key, value in event.items()
-            if key not in {"id", "_draft_status"}
+            if key not in _DRAFT_META_KEYS
         }
+
+    @staticmethod
+    def _choice_meta(event: dict) -> dict:
+        if not event.get("_choice_group_id"):
+            return {}
+        return {
+            "choice_group_id": event["_choice_group_id"],
+            "option_label": event.get("_option_label") or "",
+        }
+
+    def _create_action(self, event: dict) -> dict:
+        return {
+            "type": "create",
+            "draft_id": str(event["id"]),
+            "event": self._public_event(event),
+            **self._choice_meta(event),
+        }
+
+    def _add_create_draft(self, event: dict, group_id: str = "", label: str = "") -> dict:
+        event["id"] = f"draft-{uuid.uuid4()}"
+        event["_draft_status"] = "pending_approval"
+        if group_id:
+            event["_choice_group_id"] = group_id
+            event["_option_label"] = label
+        self.events.append(event)
+        self.actions.append(self._create_action(event))
+        return event
 
     def pending_drafts(self) -> List[dict]:
         return [
@@ -310,6 +417,7 @@ class PlanningContext:
                 "draft_id": str(event["id"]),
                 "status": "pending_approval",
                 "event": self._public_event(event),
+                **self._choice_meta(event),
             }
             for event in self.events
             if event.get("_draft_status") == "pending_approval"
@@ -332,7 +440,7 @@ class PlanningContext:
         return start, _clean_date(event.get("date")) or start
 
     def _scope(self, args: dict) -> tuple[str, str, Optional[dict]]:
-        scope = args.get("scope") if args.get("scope") in {"future", "all", "past"} else "future"
+        scope = args.get("scope") if args.get("scope") in {"future", "all", "past", "single"} else "future"
         effective = _clean_date(args.get("effective_date")) or self.today
         if args.get("effective_date") is not None and not _clean_date(args.get("effective_date")):
             return scope, effective, {"success": False, "message": "effective_date 必须是有效的 YYYY-MM-DD 日期。"}
@@ -397,6 +505,141 @@ class PlanningContext:
             return end is None or end >= effective
         return not start or start <= effective
 
+    @staticmethod
+    def _is_series(event: dict) -> bool:
+        return bool(event.get("isRecurring") or event.get("isLongTerm"))
+
+    def _plan_single_update(self, event: dict, event_id: str, updates: dict, date: str) -> dict:
+        """scope=single: override one occurrence; the client stores it in occurrenceOverrides."""
+        if event.get("isDeadline"):
+            return {"success": False, "message": "Deadline 任务不支持单次修改，请使用 future 或 all。"}
+        extra = sorted(set(updates) - _OCCURRENCE_FIELDS)
+        if extra:
+            return {
+                "success": False,
+                "message": f"单次修改只能改 event/time/location/note/urgency，不能改：{', '.join(extra)}。",
+            }
+        if not _scheduled_ignoring_skips(event, date):
+            return {"success": False, "message": f"该日程在 {date} 没有安排，无法单次修改。"}
+        if self._is_series(event):
+            overrides = deepcopy(event.get("occurrenceOverrides") or {})
+            overrides[date] = {**overrides.get(date, {}), **updates}
+            event["occurrenceOverrides"] = overrides
+            event["skippedDates"] = sorted(_skipped_dates(event) - {date})
+        else:
+            event.update(updates)
+        self.actions.append({
+            "type": "update", "id": event_id, "updates": updates,
+            "scope": "single", "effective_date": date,
+        })
+        return {"success": True, "occurrence_date": date, "event": event}
+
+    def _plan_single_delete(self, event: dict, event_id: str, date: str) -> dict:
+        """scope=single: skip one occurrence; the client stores it in skippedDates."""
+        if event.get("isDeadline"):
+            return {"success": False, "message": "Deadline 任务不支持单次删除，请使用 future 或 all。"}
+        if not _event_occurs_on(event, date):
+            return {"success": False, "message": f"该日程在 {date} 没有安排（或已跳过），无法单次删除。"}
+        if self._is_series(event):
+            event["skippedDates"] = sorted(_skipped_dates(event) | {date})
+            overrides = deepcopy(event.get("occurrenceOverrides") or {})
+            overrides.pop(date, None)
+            event["occurrenceOverrides"] = overrides
+        else:
+            self.events.remove(event)
+        self.actions.append({
+            "type": "delete", "id": event_id,
+            "scope": "single", "effective_date": date,
+        })
+        return {"success": True, "skipped_date": date, "event": event}
+
+    @staticmethod
+    def _build_create_event(args: dict) -> tuple[Optional[dict], Optional[dict]]:
+        """Validate create_event arguments into a draft body, or return an error result."""
+        title = str(args.get("event") or "").strip()
+        if not title:
+            return None, {"success": False, "message": "日程标题不能为空。"}
+        date = _clean_date(args.get("date"))
+        if not date:
+            return None, {
+                "success": False,
+                "message": "日期无效：请使用 YYYY-MM-DD 格式，例如 2026-08-20。",
+            }
+        raw_time = str(args.get("time") or "").strip()
+        if raw_time and not _clean_time(raw_time):
+            return None, {"success": False, "message": "时间无效：请使用 00:00-23:59。"}
+        if sum(bool(args.get(key)) for key in ("isLongTerm", "isDeadline", "isRecurring")) > 1:
+            return None, {"success": False, "message": "长期、Deadline 与循环任务类型不能同时设置。"}
+        if args.get("urgency") not in {None, "normal", "high"}:
+            return None, {"success": False, "message": "urgency 必须是 normal 或 high。"}
+        event = {
+            "event": title,
+            "date": date,
+            "time": _clean_time(raw_time),
+            "location": str(args.get("location") or ""),
+            "note": str(args.get("note") or ""),
+            "urgency": "high" if args.get("urgency") == "high" else "normal",
+        }
+        if args.get("isLongTerm"):
+            event["isLongTerm"] = True
+            event["startDate"] = date
+        elif args.get("isDeadline"):
+            raw_start = str(args.get("startDate") or "").strip()
+            raw_deadline = str(args.get("deadlineDate") or "").strip()
+            start = _clean_date(raw_start) if raw_start else date
+            deadline = _clean_date(raw_deadline) if raw_deadline else date
+            if (raw_start and not start) or (raw_deadline and not deadline):
+                return None, {"success": False, "message": "Deadline 日期必须是真实的 YYYY-MM-DD 日期。"}
+            if deadline < start:
+                return None, {
+                    "success": False,
+                    "message": "Deadline 截止日期不能早于开始日期。",
+                }
+            event["isDeadline"] = True
+            event["date"] = start
+            event["startDate"] = start
+            event["deadlineDate"] = deadline
+        if args.get("isRecurring") and not event.get("isLongTerm"):
+            recurring_type = args.get("recurringType") or "daily"
+            if recurring_type not in {"daily", "weekly", "monthly"}:
+                return None, {"success": False, "message": "recurringType 必须是 daily、weekly 或 monthly。"}
+            event["isRecurring"] = True
+            event["startDate"] = date
+            event["recurringType"] = recurring_type
+            if event["recurringType"] == "weekly":
+                days = _int_list(args.get("recurringDays"), 0, 6)
+                if not days:
+                    return None, {"success": False, "message": "每周循环必须至少提供一个 recurringDays。"}
+                event["recurringDays"] = days
+            elif event["recurringType"] == "monthly":
+                days = _int_list(args.get("recurringMonthDays"), 1, 31)
+                if days:
+                    event["recurringMonthDays"] = days
+            raw_end = str(args.get("endDate") or "").strip()
+            end = _clean_date(raw_end)
+            if raw_end and not end:
+                return None, {"success": False, "message": "重复结束日期必须是真实的 YYYY-MM-DD 日期。"}
+            if end:
+                if end < event["date"]:
+                    return None, {
+                        "success": False,
+                        "message": "重复结束日期不能早于开始日期。",
+                    }
+                event["endDate"] = end
+        minutes = args.get("targetDurationMinutes")
+        if minutes is not None:
+            try:
+                minutes = int(minutes)
+            except (TypeError, ValueError):
+                minutes = -1
+            if minutes <= 0:
+                return None, {
+                    "success": False,
+                    "message": "targetDurationMinutes 必须是正整数。",
+                }
+            event["targetDurationMinutes"] = minutes
+        return event, None
+
     def execute(self, name: str, args: dict) -> dict:
         if name == "list_events":
             keyword = str(args.get("keyword") or "").lower().strip()
@@ -412,8 +655,12 @@ class PlanningContext:
             rendered = []
             for event in results[:100]:
                 item = deepcopy(event)
+                meta = self._choice_meta(item)
+                item.pop("_choice_group_id", None)
+                item.pop("_option_label", None)
                 if item.pop("_draft_status", None) == "pending_approval":
                     item["storage_status"] = "pending_approval_not_saved"
+                    item.update(meta)
                 else:
                     item["storage_status"] = "saved_event"
                 rendered.append(item)
@@ -424,98 +671,37 @@ class PlanningContext:
                 "truncated": len(results) > len(rendered),
             }
         if name == "create_event":
-            title = str(args.get("event") or "").strip()
-            if not title:
-                return {"success": False, "message": "日程标题不能为空。"}
-            date = _clean_date(args.get("date"))
-            if not date:
-                return {
-                    "success": False,
-                    "message": "日期无效：请使用 YYYY-MM-DD 格式，例如 2026-08-20。",
-                }
-            raw_time = str(args.get("time") or "").strip()
-            if raw_time and not _clean_time(raw_time):
-                return {"success": False, "message": "时间无效：请使用 00:00-23:59。"}
-            if sum(bool(args.get(key)) for key in ("isLongTerm", "isDeadline", "isRecurring")) > 1:
-                return {"success": False, "message": "长期、Deadline 与循环任务类型不能同时设置。"}
-            if args.get("urgency") not in {None, "normal", "high"}:
-                return {"success": False, "message": "urgency 必须是 normal 或 high。"}
-            draft_id = f"draft-{uuid.uuid4()}"
-            event = {
-                "event": title,
-                "date": date,
-                "time": _clean_time(raw_time),
-                "location": str(args.get("location") or ""),
-                "note": str(args.get("note") or ""),
-                "urgency": "high" if args.get("urgency") == "high" else "normal",
-            }
-            if args.get("isLongTerm"):
-                event["isLongTerm"] = True
-                event["startDate"] = date
-            elif args.get("isDeadline"):
-                raw_start = str(args.get("startDate") or "").strip()
-                raw_deadline = str(args.get("deadlineDate") or "").strip()
-                start = _clean_date(raw_start) if raw_start else date
-                deadline = _clean_date(raw_deadline) if raw_deadline else date
-                if (raw_start and not start) or (raw_deadline and not deadline):
-                    return {"success": False, "message": "Deadline 日期必须是真实的 YYYY-MM-DD 日期。"}
-                if deadline < start:
-                    return {
-                        "success": False,
-                        "message": "Deadline 截止日期不能早于开始日期。",
-                    }
-                event["isDeadline"] = True
-                event["date"] = start
-                event["startDate"] = start
-                event["deadlineDate"] = deadline
-            if args.get("isRecurring") and not event.get("isLongTerm"):
-                recurring_type = args.get("recurringType") or "daily"
-                if recurring_type not in {"daily", "weekly", "monthly"}:
-                    return {"success": False, "message": "recurringType 必须是 daily、weekly 或 monthly。"}
-                event["isRecurring"] = True
-                event["startDate"] = date
-                event["recurringType"] = recurring_type
-                if event["recurringType"] == "weekly":
-                    days = _int_list(args.get("recurringDays"), 0, 6)
-                    if not days:
-                        return {"success": False, "message": "每周循环必须至少提供一个 recurringDays。"}
-                    event["recurringDays"] = days
-                elif event["recurringType"] == "monthly":
-                    days = _int_list(args.get("recurringMonthDays"), 1, 31)
-                    if days:
-                        event["recurringMonthDays"] = days
-                raw_end = str(args.get("endDate") or "").strip()
-                end = _clean_date(raw_end)
-                if raw_end and not end:
-                    return {"success": False, "message": "重复结束日期必须是真实的 YYYY-MM-DD 日期。"}
-                if end:
-                    if end < event["date"]:
-                        return {
-                            "success": False,
-                            "message": "重复结束日期不能早于开始日期。",
-                        }
-                    event["endDate"] = end
-            minutes = args.get("targetDurationMinutes")
-            if minutes is not None:
-                try:
-                    minutes = int(minutes)
-                except (TypeError, ValueError):
-                    minutes = -1
-                if minutes <= 0:
-                    return {
-                        "success": False,
-                        "message": "targetDurationMinutes 必须是正整数。",
-                    }
-                event["targetDurationMinutes"] = minutes
-            event["id"] = draft_id
-            event["_draft_status"] = "pending_approval"
-            self.events.append(event)
-            self.actions.append({
-                "type": "create",
-                "draft_id": draft_id,
-                "event": self._public_event(event),
-            })
+            event, error = self._build_create_event(args)
+            if error:
+                return error
+            self._add_create_draft(event)
             return {"success": True, "event": event}
+        if name == "propose_event_options":
+            options = args.get("options")
+            if not isinstance(options, list) or not 2 <= len(options) <= _MAX_OPTIONS:
+                return {"success": False, "message": f"options 必须包含 2-{_MAX_OPTIONS} 个候选方案。"}
+            built = []
+            for index, option in enumerate(options, start=1):
+                if not isinstance(option, dict) or not isinstance(option.get("event"), dict):
+                    return {"success": False, "message": f"第 {index} 个方案缺少 event。"}
+                label = str(option.get("label") or "").strip()[:_OPTION_LABEL_MAX]
+                if not label:
+                    return {"success": False, "message": f"第 {index} 个方案缺少 label。"}
+                event, error = self._build_create_event(option["event"])
+                if error:
+                    return {"success": False, "message": f"第 {index} 个方案无效：{error['message']}"}
+                built.append((label, event))
+            group_id = f"choice-{uuid.uuid4()}"
+            drafts = [self._add_create_draft(event, group_id, label) for label, event in built]
+            return {
+                "success": True,
+                "choice_group_id": group_id,
+                "options": [
+                    {"draft_id": draft["id"], "label": draft["_option_label"]}
+                    for draft in drafts
+                ],
+                "note": "用户只能选其中一个方案，审批前都未写入日历。",
+            }
         if name == "update_event":
             event_id = args.get("id")
             event = next(
@@ -538,6 +724,8 @@ class PlanningContext:
             scope, effective, scope_error = self._scope(args)
             if scope_error:
                 return scope_error
+            if scope == "single" and event.get("_draft_status") != "pending_approval":
+                return self._plan_single_update(event, str(event_id), updates, effective)
             if event.get("_draft_status") != "pending_approval":
                 if not self._scope_applies(event, scope, effective):
                     return {"success": False, "message": f"该日程不在 {scope} 范围内，未生成修改动作。"}
@@ -559,11 +747,7 @@ class PlanningContext:
                     action for action in self.actions
                     if action.get("draft_id") != str(event_id)
                 ]
-                self.actions.append({
-                    "type": "create",
-                    "draft_id": str(event_id),
-                    "event": self._public_event(event),
-                })
+                self.actions.append(self._create_action(event))
             else:
                 self.actions.append({
                     "type": "update", "id": str(event_id), "updates": updates,
@@ -594,6 +778,8 @@ class PlanningContext:
             scope, effective, scope_error = self._scope(args)
             if scope_error:
                 return scope_error
+            if scope == "single":
+                return self._plan_single_delete(event, str(event_id), effective)
             if not self._scope_applies(event, scope, effective):
                 return {"success": False, "message": f"该日程不在 {scope} 范围内，未生成删除动作。"}
             self.actions.append({
@@ -604,14 +790,16 @@ class PlanningContext:
         return {"success": False, "message": f"不支持的工具：{name}"}
 
 
-_ALL_TOOL_NAMES = ["list_events", "create_event", "update_event", "delete_event"]
+_ALL_TOOL_NAMES = [
+    "list_events", "create_event", "propose_event_options", "update_event", "delete_event",
+]
 
 
 def select_tools(message: Optional[str] = None) -> List[dict]:
     """Inject every tool definition on every round.
 
-    Keyword/intent routing was removed: the model must be able to see all four
-    tools on each call so short, context-dependent phrases (e.g. "只改这一次")
+    Keyword/intent routing was removed: the model must be able to see every
+    tool on each call so short, context-dependent phrases (e.g. "只改这一次")
     are never limited to a guessed subset.
     """
     return [TOOL_DEFINITIONS[name] for name in _ALL_TOOL_NAMES]
@@ -714,6 +902,13 @@ class AgentService:
             status = receipt.get("status")
             if status == "approved" and receipt.get("event_id"):
                 pending.remove(match)
+                group_id = match.get("choice_group_id")
+                if group_id:
+                    # Choosing one alternative implicitly rejects its siblings.
+                    pending = [
+                        draft for draft in pending
+                        if draft.get("choice_group_id") != group_id
+                    ]
                 next_state["recent_reference"] = {
                     "storage_status": "saved_event",
                     "event_id": receipt.get("event_id"),
@@ -940,6 +1135,11 @@ class AgentService:
                 "修改或删除前必须先 list_events，禁止猜测 ID。"
                 "update_event/delete_event 的 scope 默认为 future，effective_date 默认为今天；"
                 "只有用户明确要求全部或过去时才使用 all/past。跨越边界的系列由客户端分割，历史实例会保留。"
+                "用户只想改循环/长期任务的某一天（如“明天上班改成七点”），用 update_event scope=single、"
+                "effective_date=那一天，只改 event/time/location/note/urgency；"
+                "只想跳过某一天（如“明天请假不去”），用 delete_event scope=single；"
+                "“以后都不去了/删掉以后的”才用 delete_event scope=future。"
+                "日程中的 occurrenceOverrides 是某天的单次调整，skippedDates 是已跳过的日期。"
                 "Deadline 任务设置 isDeadline=true 并给出 startDate/deadlineDate；"
                 "循环任务设置 isRecurring=true（每周用 recurringDays 0-6，每月用 recurringMonthDays 1-31，可多个，短月份自动跳过）；"
                 "长期任务（每天显示直到完成）设置 isLongTerm=true。"
@@ -948,7 +1148,12 @@ class AgentService:
                 "用户只回复 1/2 等选项时，必须对应紧邻的助手选项，不得解释成日程序号。"
                 "修改待审批草案时使用其 draft_id，仍返回待审批创建草案。"
                 "不要声称待审批草案已经写入数据；工具成功后用简洁中文说明具体规划结果。"
-                "如果信息不足或日期无法确定，先提出一个最关键的澄清问题，不调用写工具。"
+                "用户想新增日程但时间、是否重复等关键信息模棱两可时（如“提醒我吃晚饭”），"
+                "不要追问，改用 propose_event_options 给出 2-4 个互斥方案供用户选择，"
+                "通常包括：不设时间（日期默认今天）、按常识推测一个时间、设为长期/每天重复；"
+                "回复中用一句话说明各方案，并提示用户在下方选择其一。"
+                "结构化状态中带 choice_group_id 的草案属于同一组互斥候选，用户只会批准其中一个。"
+                "如果连要做什么都无法确定，先提出一个最关键的澄清问题，不调用写工具。"
                 f"当前结构化会话状态：{self._state_for_model(session_state)}"
             )
             messages = [{"role": "system", "content": system}, *history]
@@ -1064,7 +1269,7 @@ def _render_snapshot(snapshot: List[dict]) -> str:
     lines = []
     for event in snapshot[: settings.ai_max_snapshot_events]:
         try:
-            lines.append(_dump({
+            row = {
                 "id": event.get("id"),
                 "event": event.get("event"),
                 "date": event.get("date"),
@@ -1072,7 +1277,12 @@ def _render_snapshot(snapshot: List[dict]) -> str:
                 "isDeadline": event.get("isDeadline"),
                 "isRecurring": event.get("isRecurring"),
                 "isCompleted": event.get("isCompleted"),
-            }))
+            }
+            # Only present on series with per-day exceptions, so most rows stay small.
+            for key in ("isLongTerm", "occurrenceOverrides", "skippedDates"):
+                if event.get(key):
+                    row[key] = event.get(key)
+            lines.append(_dump(row))
         except Exception:
             continue
     return "\n".join(lines)

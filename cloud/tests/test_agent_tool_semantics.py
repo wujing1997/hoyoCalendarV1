@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from .helpers import auth_headers, make_user
@@ -315,7 +316,8 @@ def test_model_schema_exposes_scope_and_all_editable_task_fields():
 
     update = TOOL_DEFINITIONS["update_event"]["function"]["parameters"]["properties"]
     delete = TOOL_DEFINITIONS["delete_event"]["function"]["parameters"]["properties"]
-    assert update["scope"]["enum"] == ["future", "all", "past"]
+    assert update["scope"]["enum"] == ["future", "all", "past", "single"]
+    assert delete["scope"]["enum"] == ["future", "all", "past", "single"]
     assert delete["scope"]["default"] == "future"
     for field in (
         "event", "date", "time", "location", "note", "urgency", "calendar",
@@ -417,3 +419,226 @@ def test_pending_draft_full_update_remains_a_create_draft():
     assert context.actions[0]["type"] == "create"
     assert context.actions[0]["draft_id"] == "draft-scope"
     assert context.actions[0]["event"]["isDeadline"] is True
+
+
+DINNER_OPTIONS = [
+    {"label": "不设时间", "event": {"event": "吃晚饭", "date": TODAY}},
+    {"label": "今天 18:30", "event": {"event": "吃晚饭", "date": TODAY, "time": "18:30"}},
+    {"label": "每天 18:30 重复", "event": {
+        "event": "吃晚饭", "date": TODAY, "time": "18:30",
+        "isRecurring": True, "recurringType": "daily",
+    }},
+]
+
+
+def test_propose_event_options_schema_reuses_create_event_fields():
+    from app.modules.agent.service import TOOL_DEFINITIONS, select_tools
+    from app.schemas import AgentAction
+
+    create = TOOL_DEFINITIONS["create_event"]["function"]["parameters"]["properties"]
+    params = TOOL_DEFINITIONS["propose_event_options"]["function"]["parameters"]
+    options = params["properties"]["options"]
+    assert params["required"] == ["options"]
+    assert (options["minItems"], options["maxItems"]) == (2, 4)
+    assert options["items"]["properties"]["event"]["properties"] == create
+    assert options["items"]["required"] == ["label", "event"]
+    assert "propose_event_options" in {
+        tool["function"]["name"] for tool in select_tools("提醒我吃晚饭")
+    }
+    parsed = AgentAction.model_validate({
+        "type": "create", "draft_id": "draft-1", "event": {"event": "x", "date": TODAY},
+        "choice_group_id": "choice-1", "option_label": "不设时间",
+    })
+    assert parsed.choice_group_id == "choice-1"
+
+
+def test_propose_event_options_emits_one_create_draft_per_option_in_one_group():
+    context = _context()
+
+    result = context.execute("propose_event_options", {"options": DINNER_OPTIONS})
+
+    assert result["success"] is True
+    assert [action["type"] for action in context.actions] == ["create"] * 3
+    group_ids = {action["choice_group_id"] for action in context.actions}
+    assert group_ids == {result["choice_group_id"]}
+    assert [action["option_label"] for action in context.actions] == [
+        "不设时间", "今天 18:30", "每天 18:30 重复",
+    ]
+    assert context.actions[0]["event"]["time"] == ""
+    assert context.actions[1]["event"]["time"] == "18:30"
+    assert context.actions[2]["event"]["isRecurring"] is True
+    assert context.actions[2]["event"]["recurringType"] == "daily"
+    for action in context.actions:
+        assert not any(key.startswith("_") for key in action["event"])
+    drafts = context.pending_drafts()
+    assert {draft["choice_group_id"] for draft in drafts} == group_ids
+    listed = context.execute("list_events", {"keyword": "晚饭"})
+    assert all(item["choice_group_id"] in group_ids for item in listed["events"])
+    assert all("_choice_group_id" not in item for item in listed["events"])
+
+
+def test_propose_event_options_is_atomic_and_bounds_option_count():
+    context = _context()
+    bad = deepcopy(DINNER_OPTIONS)
+    bad[1]["event"]["time"] = "25:00"
+
+    for args in (
+        {"options": bad},
+        {"options": DINNER_OPTIONS[:1]},
+        {"options": DINNER_OPTIONS * 2},
+        {"options": [{"label": "", "event": {"event": "x", "date": TODAY}}] * 2},
+        {"options": [{"label": "a"}, {"label": "b"}]},
+    ):
+        result = context.execute("propose_event_options", args)
+        assert result["success"] is False, args
+
+    assert context.actions == []
+    assert context.pending_drafts() == []
+
+
+def test_updating_and_reloading_an_option_draft_keeps_its_choice_group():
+    from app.modules.agent.service import PlanningContext
+
+    first = _context()
+    first.execute("propose_event_options", {"options": DINNER_OPTIONS})
+    drafts = first.pending_drafts()
+
+    context = PlanningContext([], pending_drafts=drafts, today=TODAY)
+    target = drafts[1]["draft_id"]
+    result = context.execute("update_event", {"id": target, "time": "19:00"})
+
+    assert result["success"] is True
+    action = context.actions[0]
+    assert action["draft_id"] == target
+    assert action["event"]["time"] == "19:00"
+    assert action["choice_group_id"] == drafts[1]["choice_group_id"]
+    assert action["option_label"] == "今天 18:30"
+
+
+def test_approving_one_option_receipt_drops_its_sibling_drafts():
+    from app.modules.agent.service import AgentService
+
+    context = _context()
+    context.execute("propose_event_options", {"options": DINNER_OPTIONS})
+    plan_id = str(uuid.uuid4())
+    state = AgentService._state_after_plan({}, context, plan_id, [])
+    other = {"draft_id": "unrelated", "plan_id": plan_id, "event": {"event": "其他"}}
+    state["pending_drafts"].append(other)
+    chosen = state["pending_drafts"][2]
+
+    next_state = AgentService._apply_receipts(state, [{
+        "plan_id": plan_id, "draft_id": chosen["draft_id"],
+        "status": "approved", "event_id": "saved-uuid",
+    }])
+
+    assert next_state["pending_drafts"] == [other]
+    assert next_state["recent_reference"]["event_id"] == "saved-uuid"
+
+
+WORK = {
+    "id": "work", "event": "去上班", "date": "2026-08-01", "time": "18:00",
+    "isRecurring": True, "recurringType": "daily", "startDate": "2026-08-01",
+}
+
+
+def test_single_update_overrides_one_occurrence_only():
+    context = _listed_context(deepcopy(WORK))
+
+    result = context.execute("update_event", {
+        "id": "work", "time": "19:00", "scope": "single", "effective_date": "2026-08-21",
+    })
+
+    assert result["success"] is True
+    assert context.actions == [{
+        "type": "update", "id": "work", "updates": {"time": "19:00"},
+        "scope": "single", "effective_date": "2026-08-21",
+    }]
+    event = context.events[0]
+    assert event["time"] == "18:00"
+    assert event["occurrenceOverrides"] == {"2026-08-21": {"time": "19:00"}}
+
+
+def test_single_update_rejects_series_fields_deadlines_and_unscheduled_days():
+    weekly = {**WORK, "id": "weekly", "event": "周会", "recurringType": "weekly", "recurringDays": [1]}
+    deadline = {"id": "ddl", "event": "报告", "date": TODAY, "isDeadline": True,
+                "startDate": TODAY, "deadlineDate": "2026-08-31"}
+    from app.modules.agent.service import PlanningContext
+
+    context = PlanningContext([deepcopy(WORK), weekly, deadline], today=TODAY)
+    context.execute("list_events", {})
+
+    for args in (
+        {"id": "work", "recurringType": "weekly", "recurringDays": [1]},
+        {"id": "work", "date": "2026-08-22"},
+        {"id": "weekly", "time": "10:00", "effective_date": "2026-08-20"},  # 周四
+        {"id": "work", "time": "19:00", "effective_date": "2026-07-31"},
+        {"id": "ddl", "time": "10:00"},
+    ):
+        result = context.execute("update_event", {"scope": "single", "effective_date": TODAY, **args})
+        assert result["success"] is False, args
+    assert context.actions == []
+
+
+def test_single_delete_skips_one_day_and_list_events_honours_it():
+    context = _listed_context(deepcopy(WORK))
+
+    result = context.execute("delete_event", {
+        "id": "work", "scope": "single", "effective_date": "2026-08-21",
+    })
+    again = context.execute("delete_event", {
+        "id": "work", "scope": "single", "effective_date": "2026-08-21",
+    })
+
+    assert result["success"] is True
+    assert again["success"] is False
+    assert context.actions == [{
+        "type": "delete", "id": "work", "scope": "single", "effective_date": "2026-08-21",
+    }]
+    assert context.execute("list_events", {"date": "2026-08-21"})["count"] == 0
+    assert context.execute("list_events", {"date": "2026-08-22"})["count"] == 1
+    assert context.execute("list_events", {
+        "start_date": "2026-08-21", "end_date": "2026-08-21",
+    })["count"] == 0
+
+
+def test_single_update_on_a_skipped_day_restores_it():
+    skipped = {**deepcopy(WORK), "skippedDates": ["2026-08-21"]}
+    context = _listed_context(skipped)
+
+    result = context.execute("update_event", {
+        "id": "work", "time": "20:00", "scope": "single", "effective_date": "2026-08-21",
+    })
+
+    assert result["success"] is True
+    assert context.events[0]["skippedDates"] == []
+    assert context.execute("list_events", {"date": "2026-08-21"})["count"] == 1
+
+
+def test_single_scope_on_one_off_event_applies_only_on_its_own_day():
+    one_off = {"id": "dinner", "event": "聚餐", "date": "2026-08-21", "time": "18:00"}
+    context = _listed_context(one_off)
+
+    wrong_day = context.execute("update_event", {
+        "id": "dinner", "time": "19:00", "scope": "single", "effective_date": "2026-08-22",
+    })
+    right_day = context.execute("update_event", {
+        "id": "dinner", "time": "19:00", "scope": "single", "effective_date": "2026-08-21",
+    })
+
+    assert wrong_day["success"] is False
+    assert right_day["success"] is True
+    assert context.actions[0]["scope"] == "single"
+
+
+def test_snapshot_exposes_occurrence_exceptions_to_the_model():
+    from app.modules.agent.service import _render_snapshot
+
+    rendered = _render_snapshot([
+        {**WORK, "occurrenceOverrides": {"2026-08-21": {"time": "19:00"}},
+         "skippedDates": ["2026-08-22"]},
+        {"id": "plain", "event": "普通", "date": TODAY},
+    ]).splitlines()
+
+    assert json.loads(rendered[0])["occurrenceOverrides"] == {"2026-08-21": {"time": "19:00"}}
+    assert json.loads(rendered[0])["skippedDates"] == ["2026-08-22"]
+    assert "skippedDates" not in json.loads(rendered[1])

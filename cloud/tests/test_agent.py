@@ -182,7 +182,7 @@ def test_agent_requires_auth(client):
     assert resp.status_code == 401
 
 
-def test_select_tools_injects_all_four_tools():
+def test_select_tools_injects_every_tool():
     from app.modules.agent.service import select_tools
 
     for message in (
@@ -194,7 +194,9 @@ def test_select_tools_injects_all_four_tools():
         "修改日程",
     ):
         names = [t["function"]["name"] for t in select_tools(message)]
-        assert names == ["list_events", "create_event", "update_event", "delete_event"], message
+        assert names == [
+            "list_events", "create_event", "propose_event_options", "update_event", "delete_event",
+        ], message
 
 
 def test_select_tools_ignores_message_intent():
@@ -202,7 +204,9 @@ def test_select_tools_ignores_message_intent():
 
     # Short/context-dependent phrases must not be limited to a guessed subset.
     names = [t["function"]["name"] for t in select_tools("只改这一次")]
-    assert names == ["list_events", "create_event", "update_event", "delete_event"]
+    assert names == [
+        "list_events", "create_event", "propose_event_options", "update_event", "delete_event",
+    ]
 
 
 def test_create_event_tool_covers_all_task_types():

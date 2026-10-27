@@ -280,6 +280,21 @@
     return '每天';
   }
 
+  // The detail form edits the whole series; tell the user when the selected day differs.
+  function occurrenceNoteMarkup(event) {
+    const day = dateKey(state.selectedDate);
+    if ((event.skippedDates || []).includes(day)) {
+      return '<div class="detail-occurrence-note">这一天已单独跳过，下方修改作用于整个系列。</div>';
+    }
+    const override = event.occurrenceOverrides?.[day];
+    if (!override) return '';
+    const labels = { event: '标题', time: '时间', location: '地点', note: '备注', urgency: '紧急度' };
+    const parts = Object.entries(override).map(([key, value]) => (
+      `${labels[key] || key} ${key === 'time' && !value ? '不设时间' : value}`
+    ));
+    return `<div class="detail-occurrence-note">这一天单独调整为：${escapeHtml(parts.join('，'))}；下方修改作用于整个系列。</div>`;
+  }
+
   function detailTypeText(event) {
     const calendar = escapeHtml(event.calendar || '个人');
     if (event.isLongTerm) {
@@ -605,6 +620,9 @@
     if (event.isRecurring) {
       metadata.push(`<span class="meta-item">${icon('repeat')} ${recurrenceLabel(event)}</span>`);
     }
+    if (event.hasOccurrenceOverride) {
+      metadata.push(`<span class="meta-item meta-occurrence">${icon('pencil')} 本次已调整</span>`);
+    }
     if (event.location) {
       metadata.push(`
         <span class="meta-item meta-location">
@@ -784,6 +802,7 @@
               aria-label="任务标题"
             >
             <div class="detail-type">${detailTypeText(event)}</div>
+            ${occurrenceNoteMarkup(event)}
           </div>
         </div>
 
@@ -1548,7 +1567,12 @@
       return;
     }
 
-    appendAssistantMessage('assistant', `${result.message}（${actions.length} 项候选操作）`);
+    const { singles, groups } = groupApprovalActions(actions);
+    const countText = [
+      singles.length ? `${singles.length} 项候选操作` : '',
+      groups.length ? `${groups.length} 组方案待选择` : '',
+    ].filter(Boolean).join('，');
+    appendAssistantMessage('assistant', `${result.message}（${countText}）`);
     appendActionApprovalCard(actions, result);
 
     state.assistantBusy = false;
@@ -1557,37 +1581,78 @@
     input.focus();
   }
 
+  // Actions sharing a choice_group_id are mutually exclusive alternatives.
+  function groupApprovalActions(actions) {
+    const singles = [];
+    const byGroup = new Map();
+    actions.forEach((action, index) => {
+      const groupId = action.choice_group_id;
+      if (!groupId) {
+        singles.push(index);
+        return;
+      }
+      if (!byGroup.has(groupId)) byGroup.set(groupId, []);
+      byGroup.get(groupId).push(index);
+    });
+    return { singles, groups: Array.from(byGroup, ([id, indices]) => ({ id, indices })) };
+  }
+
   function appendActionApprovalCard(actions, plan) {
+    const { singles, groups } = groupApprovalActions(actions);
+    const radioPrefix = `choice-${plan.plan_id || Date.now()}`;
     const card = document.createElement('div');
     card.className = 'approval-card';
     card.innerHTML = `
       <div class="approval-head">
-        <span>候选操作需要你确认后才能写入</span>
-        <label class="approval-select-all">
-          <input type="checkbox" class="approval-all-check" checked>
-          <span>全选</span>
-        </label>
-      </div>
-      <div class="approval-actions">
-        ${actions.map((action, index) => `
-          <label class="approval-action ${action.type}">
-            <input type="checkbox" class="approval-check" data-action-index="${index}" checked>
-            <span class="approval-type">${approvalTypeLabel(action)}</span>
-            <span class="approval-summary">${escapeHtml(approvalSummary(action))}</span>
+        <span>${groups.length ? '请选择方案，确认后才会写入' : '候选操作需要你确认后才能写入'}</span>
+        ${singles.length > 1 ? `
+          <label class="approval-select-all">
+            <input type="checkbox" class="approval-all-check" checked>
+            <span>全选</span>
           </label>
-        `).join('')}
+        ` : ''}
       </div>
+      ${groups.map((group, groupIndex) => `
+        <div class="approval-choice-group" role="radiogroup">
+          <div class="approval-choice-title">方案 ${groups.length > 1 ? groupIndex + 1 : ''}（单选）</div>
+          ${group.indices.map((index) => `
+            <label class="approval-action approval-option">
+              <input type="radio" class="approval-radio" name="${radioPrefix}-${groupIndex}" data-action-index="${index}">
+              <span class="approval-option-text">
+                <span class="approval-option-label">${escapeHtml(actions[index].option_label || approvalTypeLabel(actions[index]))}</span>
+                <span class="approval-summary">${escapeHtml(approvalSummary(actions[index]))}</span>
+              </span>
+            </label>
+          `).join('')}
+        </div>
+      `).join('')}
+      ${singles.length ? `
+        <div class="approval-actions">
+          ${singles.map((index) => `
+            <label class="approval-action ${actions[index].type}">
+              <input type="checkbox" class="approval-check" data-action-index="${index}" checked>
+              <span class="approval-type">${approvalTypeLabel(actions[index])}</span>
+              <span class="approval-summary">${escapeHtml(approvalSummary(actions[index]))}</span>
+            </label>
+          `).join('')}
+        </div>
+      ` : ''}
       <div class="approval-buttons">
-        <button class="secondary-button approval-approve-all">一键同意</button>
-        <button class="primary-button approval-approve-selected">仅执行选中项</button>
+        ${groups.length ? `
+          <button class="primary-button approval-approve-selected">确认选择</button>
+        ` : `
+          <button class="secondary-button approval-approve-all">一键同意</button>
+          <button class="primary-button approval-approve-selected">仅执行选中项</button>
+        `}
         <button class="text-btn danger approval-reject">全部拒绝</button>
       </div>
+      <p class="approval-hint" hidden>请先选择一个方案，或点击“全部拒绝”。</p>
       <p class="approval-usage">${approvalUsageText(plan)}</p>
     `;
     $('#assistantBody').appendChild(card);
     $('#assistantBody').scrollTop = $('#assistantBody').scrollHeight;
 
-    card.querySelector('.approval-all-check').addEventListener('change', (event) => {
+    card.querySelector('.approval-all-check')?.addEventListener('change', (event) => {
       card.querySelectorAll('.approval-check').forEach((check) => {
         check.checked = event.target.checked;
       });
@@ -1595,6 +1660,12 @@
 
     const execute = async (indices) => {
       const results = await window.cloudAPI.approveActions(actions, indices, plan.plan_id);
+      if (results.length === 1 && results[0].type === 'invalid_choice') {
+        const hint = card.querySelector('.approval-hint');
+        hint.textContent = results[0].message;
+        hint.hidden = false;
+        return;
+      }
       const done = results.filter((result) => result.success).length;
       const failed = results.length - done;
       card.classList.add('executed');
@@ -1611,14 +1682,16 @@
       if (done) renderAll();
     };
 
-    card.querySelector('.approval-approve-all').addEventListener('click', () => {
+    card.querySelector('.approval-approve-all')?.addEventListener('click', () => {
       void execute(new Set(actions.map((_action, index) => index)));
     });
     card.querySelector('.approval-approve-selected').addEventListener('click', () => {
-      const indices = new Set(
-        Array.from(card.querySelectorAll('.approval-check:checked')).map((check) => Number(check.dataset.actionIndex)),
-      );
-      void execute(indices);
+      const checked = Array.from(card.querySelectorAll('.approval-check:checked, .approval-radio:checked'));
+      if (groups.length && !checked.length) {
+        card.querySelector('.approval-hint').hidden = false;
+        return;
+      }
+      void execute(new Set(checked.map((check) => Number(check.dataset.actionIndex))));
     });
     card.querySelector('.approval-reject').addEventListener('click', () => {
       void execute(new Set());
@@ -1638,9 +1711,13 @@
       ? '全部日期'
       : action.scope === 'past'
         ? `截至 ${action.effective_date || '今天'}`
-        : `从 ${action.effective_date || '今天'} 起`;
+        : action.scope === 'single'
+          ? `仅 ${action.effective_date || '今天'} 这一次${action.type === 'delete' ? '（跳过，其余照常）' : ''}`
+          : `从 ${action.effective_date || '今天'} 起`;
     if (action.type === 'create') {
-      return `${action.event?.event || '新日程'}${action.event?.date ? ` · ${action.event.date}` : ''}${action.event?.time ? ` ${action.event.time}` : ''}`;
+      const event = action.event || {};
+      const when = event.time ? ` ${event.time}` : action.choice_group_id ? ' 不设时间' : '';
+      return `${event.event || '新日程'}${event.date ? ` · ${event.date}` : ''}${when}${approvalRepeatText(event)}`;
     }
     if (action.type === 'update') {
       const title = getSourceEventByAnyId(action.id)?.event || '';
@@ -1654,6 +1731,21 @@
       return `${getSourceEventByAnyId(action.id)?.event || '日程'}（${scopeText}；id: ${String(action.id).slice(0, 8)}…）`;
     }
     return '未知操作';
+  }
+
+  function approvalRepeatText(event) {
+    if (event.isLongTerm) return ' · 长期任务';
+    if (event.isDeadline) return event.deadlineDate ? ` · 截止 ${event.deadlineDate}` : ' · Deadline';
+    if (!event.isRecurring) return '';
+    if (event.recurringType === 'weekly') {
+      const names = ['日', '一', '二', '三', '四', '五', '六'];
+      return ` · 每周${(event.recurringDays || []).map((day) => names[day] || '').join('、')}重复`;
+    }
+    if (event.recurringType === 'monthly') {
+      const days = event.recurringMonthDays || [];
+      return days.length ? ` · 每月 ${days.join('、')} 日重复` : ' · 每月重复';
+    }
+    return ' · 每天重复';
   }
 
   function approvalUsageText(plan) {
@@ -2110,12 +2202,17 @@
     state.windowState = await window.electronAPI?.getWindowState() || state.windowState;
     $('#windowModeSelect').value = state.windowState.mode || 'wide';
     $('#autoLaunchToggle').checked = Boolean(await window.electronAPI?.getAutoLaunch());
+    const settings = await window.configAPI.load();
+    $('#barkEnabled').checked = Boolean(settings.notifications?.bark?.enabled);
+    $('#barkEndpoint').value = settings.notifications?.bark?.endpoint || '';
     const version = await window.electronAPI?.getAppVersion();
-    $('#appVersion').textContent = `V${version || '3.0.10'}`;
+    $('#appVersion').textContent = `V${version || '3.0.12'}`;
     openOverlay('settingsOverlay');
   }
 
   async function saveSettings() {
+    const result = await window.configAPI.save({ notifications: { bark: { enabled: $('#barkEnabled').checked, endpoint: $('#barkEndpoint').value.trim() } } });
+    if (!result.success) { showToast(result.message || '手机推送设置保存失败'); return; }
     await window.electronAPI?.setAutoLaunch($('#autoLaunchToggle').checked);
     setTheme($('#themeSelect').value);
     window.electronAPI?.setWindowMode($('#windowModeSelect').value);

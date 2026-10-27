@@ -480,3 +480,28 @@ test('preload chat reset and approval bridge manage agent session state', () => 
   assert.match(preloadSource, /resetChat:\s*async[\s\S]*syncEngine\.resetAgentSession\(\)/);
   assert.match(preloadSource, /approveActions:\s*async[\s\S]*syncEngine\.approveActions[\s\S]*await syncEngine\.flushAgentReceipts\(\)/);
 });
+
+// ------------------------------------------------------------------ agent option groups
+
+test('assistant chat bubbles opt back into text selection under the body-level user-select: none', () => {
+  assert.match(stylesSource, /body\s*\{[^}]*user-select:\s*none;/);
+  assert.match(stylesSource, /\.assistant-message\s*\{[^}]*user-select:\s*text;/);
+});
+
+test('approval card renders choice groups as unchecked radios and drops approve-all', () => {
+  assert.match(rendererSource, /function groupApprovalActions\(actions\)/);
+  assert.match(rendererSource, /const groupId = action\.choice_group_id;/);
+  assert.match(rendererSource, /<input type="radio" class="approval-radio" name="\$\{radioPrefix\}-\$\{groupIndex\}" data-action-index="\$\{index\}">/);
+  assert.match(rendererSource, /\$\{groups\.length \? `\s*<button class="primary-button approval-approve-selected">确认选择<\/button>/);
+  assert.match(rendererSource, /querySelectorAll\('\.approval-check:checked, \.approval-radio:checked'\)/);
+  assert.match(rendererSource, /results\[0\]\.type === 'invalid_choice'/);
+  assert.match(stylesSource, /\.approval-option:has\(\.approval-radio:checked\)/);
+});
+
+test('single-occurrence edits are labelled on task rows, details and approval cards', () => {
+  assert.match(rendererSource, /if \(event\.hasOccurrenceOverride\) \{[\s\S]*?本次已调整/);
+  assert.match(rendererSource, /function occurrenceNoteMarkup\(event\)/);
+  assert.match(rendererSource, /\$\{occurrenceNoteMarkup\(event\)\}/);
+  assert.match(rendererSource, /action\.scope === 'single'\s*\? `仅 \$\{action\.effective_date \|\| '今天'\} 这一次/);
+  assert.match(stylesSource, /\.detail-occurrence-note\s*\{/);
+});

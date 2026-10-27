@@ -498,3 +498,168 @@ test('all-scope update converts recurring event to deadline', () => {
     assert.equal(converted.deadlineDate, '2026-08-31');
   });
 });
+
+// ------------------------------------------------------------------ single occurrence exceptions
+
+function addWork(store, extra = {}) {
+  return store.addEvent({
+    event: '去上班', date: '2026-08-01', time: '18:00',
+    isRecurring: true, recurringType: 'daily', ...extra,
+  });
+}
+
+test('single-scope update overrides one occurrence and leaves the series intact', () => {
+  withStore((store) => {
+    const work = addWork(store);
+    const [result] = store.applyActions([{
+      type: 'update', id: work.id, scope: 'single', effective_date: '2026-08-21',
+      updates: { time: '19:00' },
+    }]);
+
+    assert.equal(result.success, true);
+    assert.equal(result.occurrenceDate, '2026-08-21');
+    assert.deepEqual(result.syncChanges.map((change) => change.op), ['upsert']);
+    assert.equal(store.loadEvents().length, 1);
+    const source = store.getEvent(work.id);
+    assert.equal(source.time, '18:00');
+    assert.deepEqual(source.occurrenceOverrides, { '2026-08-21': { time: '19:00' } });
+
+    const changed = store.getEventsByDate('2026-08-21')[0];
+    assert.equal(changed.time, '19:00');
+    assert.equal(changed.hasOccurrenceOverride, true);
+    assert.equal(store.getEventsByDate('2026-08-22')[0].time, '18:00');
+    assert.equal(store.getEventsByDate('2026-08-22')[0].hasOccurrenceOverride, undefined);
+  });
+});
+
+test('setting an occurrence back to the series value drops the override', () => {
+  withStore((store) => {
+    const work = addWork(store);
+    const single = (updates) => store.applyActions([{
+      type: 'update', id: work.id, scope: 'single', effective_date: '2026-08-21', updates,
+    }])[0];
+
+    single({ time: '19:00', location: '分店' });
+    single({ time: '18:00' });
+    assert.deepEqual(store.getEvent(work.id).occurrenceOverrides, { '2026-08-21': { location: '分店' } });
+    single({ location: '' });
+    assert.equal(store.getEvent(work.id).occurrenceOverrides, undefined);
+  });
+});
+
+test('single-scope update rejects series fields, deadlines and days off the schedule', () => {
+  withStore((store) => {
+    const work = addWork(store);
+    const weekly = addWork(store, { recurringType: 'weekly', recurringDays: [1] });
+    const deadline = store.addEvent({
+      event: '报告', date: '2026-08-20', isDeadline: true, deadlineDate: '2026-08-31',
+    });
+    const results = store.applyActions([
+      { type: 'update', id: work.id, scope: 'single', effective_date: '2026-08-21', updates: { recurringType: 'weekly' } },
+      { type: 'update', id: work.id, scope: 'single', effective_date: '2026-07-31', updates: { time: '19:00' } },
+      { type: 'update', id: weekly.id, scope: 'single', effective_date: '2026-08-20', updates: { time: '19:00' } },
+      { type: 'update', id: deadline.id, scope: 'single', effective_date: '2026-08-21', updates: { time: '19:00' } },
+    ]);
+    assert.deepEqual(results.map((result) => result.error), [
+      'single_fields_not_supported', 'not_scheduled_on_date',
+      'not_scheduled_on_date', 'single_not_supported',
+    ]);
+    assert.equal(store.getEvent(work.id).occurrenceOverrides, undefined);
+  });
+});
+
+test('single-scope delete skips one day, keeps progress honest and can be restored', () => {
+  withStore((store) => {
+    const work = addWork(store, { endDate: '2026-08-10' });
+    store.toggleComplete(work.id, '2026-08-05');
+    store.applyActions([{
+      type: 'update', id: work.id, scope: 'single', effective_date: '2026-08-05', updates: { time: '19:00' },
+    }]);
+    const [skipped] = store.applyActions([{
+      type: 'delete', id: work.id, scope: 'single', effective_date: '2026-08-05',
+    }]);
+
+    assert.equal(skipped.success, true);
+    assert.equal(skipped.skippedDate, '2026-08-05');
+    assert.deepEqual(skipped.syncChanges.map((change) => change.op), ['upsert']);
+    const source = store.getEvent(work.id);
+    assert.deepEqual(source.skippedDates, ['2026-08-05']);
+    assert.equal(source.occurrenceOverrides, undefined);
+    assert.deepEqual(source.completedDates, []);
+    assert.equal(store.getEventsByDate('2026-08-05').length, 0);
+    assert.equal(store.getEventsByDate('2026-08-06')[0].progress.total, 9);
+    assert.equal(store.applyActions([{
+      type: 'delete', id: work.id, scope: 'single', effective_date: '2026-08-05',
+    }])[0].error, 'not_scheduled_on_date');
+
+    store.applyActions([{
+      type: 'update', id: work.id, scope: 'single', effective_date: '2026-08-05', updates: { time: '20:00' },
+    }]);
+    assert.equal(store.getEvent(work.id).skippedDates, undefined);
+    assert.equal(store.getEventsByDate('2026-08-05')[0].time, '20:00');
+  });
+});
+
+test('single scope works for long-term tasks and treats one-off tasks as the whole event', () => {
+  withStore((store) => {
+    const study = store.addEvent({ event: '学英语', date: '2026-08-01', isLongTerm: true });
+    store.applyActions([{ type: 'delete', id: study.id, scope: 'single', effective_date: '2026-08-03' }]);
+    assert.equal(store.getEventsByDate('2026-08-03').length, 0);
+    assert.equal(store.getEventsByDate('2026-08-04').length, 1);
+
+    const dinner = store.addEvent({ event: '聚餐', date: '2026-08-21', time: '18:00' });
+    const [moved] = store.applyActions([{
+      type: 'update', id: dinner.id, scope: 'single', effective_date: '2026-08-21', updates: { time: '19:00' },
+    }]);
+    assert.equal(moved.success, true);
+    assert.equal(store.getEvent(dinner.id).time, '19:00');
+    assert.equal(store.getEvent(dinner.id).occurrenceOverrides, undefined);
+    const [deleted] = store.applyActions([{
+      type: 'delete', id: dinner.id, scope: 'single', effective_date: '2026-08-21',
+    }]);
+    assert.deepEqual(deleted.syncChanges.map((change) => change.op), ['delete']);
+    assert.equal(store.getEvent(dinner.id), null);
+  });
+});
+
+test('splitting a series keeps each side its own occurrence exceptions', () => {
+  withStore((store) => {
+    const work = addWork(store, {
+      occurrenceOverrides: { '2026-08-05': { time: '19:00' }, '2026-08-25': { time: '20:00' } },
+      skippedDates: ['2026-08-06', '2026-08-26'],
+    });
+    const [result] = store.applyActions([{
+      type: 'update', id: work.id, scope: 'future', effective_date: '2026-08-20', updates: { location: '新公司' },
+    }]);
+
+    assert.equal(result.split, true);
+    const [, future] = result.affectedEvents;
+    assert.deepEqual(future.occurrenceOverrides, { '2026-08-25': { time: '20:00' } });
+    assert.deepEqual(future.skippedDates, ['2026-08-26']);
+    assert.equal(store.getEventsByDate('2026-08-25')[0].time, '20:00');
+    assert.equal(store.getEventsByDate('2026-08-26').length, 0);
+    assert.equal(store.getEventsByDate('2026-08-05')[0].time, '19:00');
+  });
+});
+
+test('occurrence exceptions are normalized and dropped from non-series tasks', () => {
+  withStore((store) => {
+    const work = addWork(store, {
+      occurrenceOverrides: {
+        'not-a-date': { time: '07:00' },
+        '2026-08-02': { time: '25:00', urgency: 'urgent', bogus: 1 },
+        '2026-08-03': {},
+      },
+      skippedDates: ['2026-08-09', 'bad', '2026-08-04', '2026-08-04'],
+    });
+    assert.deepEqual(work.occurrenceOverrides, { '2026-08-02': { time: '', urgency: 'normal' } });
+    assert.deepEqual(work.skippedDates, ['2026-08-04', '2026-08-09']);
+
+    const plain = store.addEvent({
+      event: '普通', date: '2026-08-01',
+      occurrenceOverrides: { '2026-08-01': { time: '09:00' } }, skippedDates: ['2026-08-01'],
+    });
+    assert.equal(plain.occurrenceOverrides, undefined);
+    assert.equal(plain.skippedDates, undefined);
+  });
+});

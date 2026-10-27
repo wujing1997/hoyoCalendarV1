@@ -7,7 +7,7 @@
     http-equiv="Content-Security-Policy"
     content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*;"
   >
-  <title>HoYoCalendar V3.0.10</title>
+  <title>HoYoCalendar V3.0.12</title>
   <link rel="stylesheet" href="node_modules/@fortawesome/fontawesome-free/css/all.min.css">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -330,11 +330,17 @@
           </label>
         </section>
 
+        <section class="settings-section">
+          <h2>手机推送 · Bark</h2>
+          <label class="settings-row"><span><strong>日程到时推送到手机</strong><small>电脑上的日历需保持运行，可隐藏到托盘</small></span><input class="switch-input" id="barkEnabled" type="checkbox"></label>
+          <label class="settings-field"><span>推送地址</span><input id="barkEndpoint" type="password" autocomplete="off" placeholder="https://api.day.app/你的推送密钥"></label>
+          <p class="field-hint">地址仅保存在本机，不参与云同步。发送任务名称、计划时间和所属日历；首次启用不补发此前已过时的任务。</p>
+        </section>
         <section class="settings-section about-section">
           <h2>关于</h2>
           <div class="about-row">
             <span>HoYoCalendar</span>
-            <strong id="appVersion">V3.0.10</strong>
+            <strong id="appVersion">V3.0.12</strong>
           </div>
           <button class="secondary-button" id="openLogsButton">
             <i class="app-icon fa-solid fa-folder-open"></i>

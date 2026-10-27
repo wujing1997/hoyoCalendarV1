@@ -24,6 +24,9 @@ function isInternalField(key) {
   return key.startsWith('_');
 }
 
+// Fields a single occurrence of a recurring / long-term task may override.
+const OCCURRENCE_FIELDS = ['event', 'time', 'location', 'note', 'urgency'];
+
 class EventStore {
   constructor(options = {}) {
     const baseDir = options.dataDir
@@ -122,10 +125,13 @@ class EventStore {
       delete event.recurringDays;
       delete event.recurringMonthDays;
       delete event.completedDates;
+      this.normalizeOccurrenceExceptions(event);
       return event;
     }
 
     if (event.isDeadline) {
+      delete event.occurrenceOverrides;
+      delete event.skippedDates;
       const startDate = this.validDate(event.startDate || event.date) || today;
       const deadlineDate = this.validDate(event.deadlineDate || event.endDate || event.date) || startDate;
       event.isDeadline = true;
@@ -185,8 +191,12 @@ class EventStore {
       delete event.isLongTerm;
       delete event.focusTotalSeconds;
       delete event.focusRunningSince;
+      this.normalizeOccurrenceExceptions(event);
       return event;
     }
+
+    delete event.occurrenceOverrides;
+    delete event.skippedDates;
 
     event.date = this.validDate(event.date || event.startDate) || today;
     event.isCompleted = Boolean(event.isCompleted || event.completed);
@@ -215,6 +225,41 @@ class EventStore {
     delete event.focusTotalSeconds;
     delete event.focusRunningSince;
     return event;
+  }
+
+  normalizeOccurrenceExceptions(event) {
+    const skipped = Array.isArray(event.skippedDates)
+      ? [...new Set(event.skippedDates.map((date) => this.validDate(date)).filter(Boolean))].sort()
+      : [];
+    if (skipped.length) event.skippedDates = skipped;
+    else delete event.skippedDates;
+
+    const raw = event.occurrenceOverrides;
+    const overrides = {};
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [key, value] of Object.entries(raw)) {
+        const date = this.validDate(key);
+        if (!date || !value || typeof value !== 'object') continue;
+        const override = this.cleanOccurrenceOverride(value);
+        if (Object.keys(override).length) overrides[date] = override;
+      }
+    }
+    if (Object.keys(overrides).length) event.occurrenceOverrides = overrides;
+    else delete event.occurrenceOverrides;
+  }
+
+  cleanOccurrenceOverride(raw) {
+    const override = {};
+    if ('event' in raw) {
+      const title = String(raw.event || '').trim();
+      if (title) override.event = title;
+    }
+    // An empty time is a real override: "no fixed time on that day".
+    if ('time' in raw) override.time = this.normalizeTime(raw.time);
+    if ('location' in raw) override.location = String(raw.location || '').trim();
+    if ('note' in raw) override.note = String(raw.note || '');
+    if ('urgency' in raw) override.urgency = raw.urgency === 'high' ? 'high' : 'normal';
+    return override;
   }
 
   normalizeTargetDuration(event) {
@@ -490,7 +535,32 @@ class EventStore {
     return this.saveEvents(events) ? clone(event) : null;
   }
 
+  isSkippedOn(event, dateStr) {
+    return (event.skippedDates || []).includes(dateStr);
+  }
+
   isRecurringOnDate(event, dateStr) {
+    return this.recurringRuleMatches(event, dateStr) && !this.isSkippedOn(event, dateStr);
+  }
+
+  // Whether the task is scheduled on a date by its own rules, ignoring skippedDates.
+  isScheduledIgnoringSkips(event, dateStr) {
+    if (!this.isWithinActiveBounds(event, dateStr)) return false;
+    if (event.isRecurring) return this.recurringRuleMatches(event, dateStr);
+    if (event.isLongTerm) {
+      if (dateStr < event.startDate) return false;
+      return !event.isCompleted || dateStr <= event.completedDate;
+    }
+    if (event.isDeadline) return false;
+    return (event.isCompleted ? event.completedDate : event.date) === dateStr;
+  }
+
+  occurrenceView(event, dateStr) {
+    const override = event.occurrenceOverrides?.[dateStr];
+    return override ? { ...event, ...override } : event;
+  }
+
+  recurringRuleMatches(event, dateStr) {
     if (!event.isRecurring || dateStr < event.startDate) return false;
     if (event.endDate && dateStr > event.endDate) return false;
     if (!this.isWithinActiveBounds(event, dateStr)) return false;
@@ -526,6 +596,11 @@ class EventStore {
       sourceDate: event.date,
       isCompleted: this.isCompletedOnDate(event, dateStr),
     };
+    const override = event.occurrenceOverrides?.[dateStr];
+    if (override) {
+      Object.assign(instance, clone(override));
+      instance.hasOccurrenceOverride = true;
+    }
 
     if (event.isDeadline) {
       instance.isDeadlineInstance = true;
@@ -554,6 +629,7 @@ class EventStore {
 
     for (const event of events) {
       if (!this.isWithinActiveBounds(event, date)) continue;
+      if (this.isSkippedOn(event, date)) continue;
       if (event.isLongTerm) {
         if (event.isCompleted) {
           const inHistory = date >= event.startDate && date <= event.completedDate;
@@ -772,10 +848,14 @@ class EventStore {
         continue;
       }
 
-      const scope = ['future', 'past', 'all'].includes(action.scope) ? action.scope : 'future';
+      const scope = ['future', 'past', 'all', 'single'].includes(action.scope) ? action.scope : 'future';
       const effectiveDate = this.validDate(action.effective_date) || formatDate(new Date());
 
-      if (action.type === 'update') {
+      if (scope === 'single') {
+        results.push(action.type === 'update'
+          ? this.applySingleUpdate(events, index, action.updates || {}, effectiveDate, now)
+          : this.applySingleDelete(events, index, effectiveDate, now));
+      } else if (action.type === 'update') {
         const result = this.applyScopedUpdate(events, index, action.updates || {}, scope, effectiveDate, now);
         results.push(result);
       } else if (action.type === 'delete' && scope !== 'all') {
@@ -872,6 +952,11 @@ class EventStore {
         scope === 'future' ? date >= effectiveDate : date <= effectiveDate
       ));
     }
+    const onSide = (date) => (scope === 'future' ? date >= effectiveDate : date <= effectiveDate);
+    replacement.skippedDates = (replacement.skippedDates || []).filter(onSide);
+    replacement.occurrenceOverrides = Object.fromEntries(
+      Object.entries(replacement.occurrenceOverrides || {}).filter(([date]) => onSide(date)),
+    );
     if (replacement.isLongTerm && scope === 'future') {
       replacement.focusTotalSeconds = 0;
       replacement.focusRunningSince = null;
@@ -976,6 +1061,79 @@ class EventStore {
       type: 'delete', success: true, event: clone(events[index]),
       affectedEvents: [clone(events[index])], truncated: true,
       syncChanges: [{ event: clone(events[index]), op: 'upsert' }],
+    };
+  }
+
+  // scope=single: change only the occurrence on `date`. Series keep a per-day
+  // override; a one-off task that falls on that day is simply updated whole.
+  applySingleUpdate(events, index, updates, date, now) {
+    const source = events[index];
+    const fail = (error) => ({ type: 'update', success: false, id: source.id, error });
+    if (source.isDeadline) return fail('single_not_supported');
+    const fields = Object.keys(updates);
+    if (!fields.length || fields.some((field) => !OCCURRENCE_FIELDS.includes(field))) {
+      return fail('single_fields_not_supported');
+    }
+    if (!this.isScheduledIgnoringSkips(source, date)) return fail('not_scheduled_on_date');
+    if (!source.isRecurring && !source.isLongTerm) {
+      return this.applyScopedUpdate(events, index, updates, 'all', date, now);
+    }
+
+    const override = {
+      ...(source.occurrenceOverrides?.[date] || {}),
+      ...this.cleanOccurrenceOverride(updates),
+    };
+    for (const field of OCCURRENCE_FIELDS) {
+      if (field in override && override[field] === source[field]) delete override[field];
+    }
+    const overrides = { ...(source.occurrenceOverrides || {}) };
+    if (Object.keys(override).length) overrides[date] = override;
+    else delete overrides[date];
+    const updated = this.normalizeEvent({
+      ...source,
+      occurrenceOverrides: overrides,
+      // Editing a skipped day brings that occurrence back.
+      skippedDates: (source.skippedDates || []).filter((skipped) => skipped !== date),
+      updatedAt: now,
+    });
+    this.markChanged(updated);
+    events[index] = updated;
+    return {
+      type: 'update', success: true, event: clone(updated), occurrenceDate: date,
+      affectedEvents: [clone(updated)], syncChanges: [{ event: clone(updated), op: 'upsert' }],
+    };
+  }
+
+  applySingleDelete(events, index, date, now) {
+    const source = events[index];
+    const fail = (error) => ({ type: 'delete', success: false, id: source.id, error });
+    if (source.isDeadline) return fail('single_not_supported');
+    if (!this.isScheduledIgnoringSkips(source, date) || this.isSkippedOn(source, date)) {
+      return fail('not_scheduled_on_date');
+    }
+    if (!source.isRecurring && !source.isLongTerm) {
+      this.markDeletedForAction(source, now);
+      events[index] = source;
+      return {
+        type: 'delete', success: true, event: clone(source),
+        affectedEvents: [clone(source)], syncChanges: [{ event: clone(source), op: 'delete' }],
+      };
+    }
+
+    const overrides = { ...(source.occurrenceOverrides || {}) };
+    delete overrides[date];
+    const updated = this.normalizeEvent({
+      ...source,
+      skippedDates: [...(source.skippedDates || []), date],
+      occurrenceOverrides: overrides,
+      completedDates: (source.completedDates || []).filter((completed) => completed !== date),
+      updatedAt: now,
+    });
+    this.markChanged(updated);
+    events[index] = updated;
+    return {
+      type: 'delete', success: true, event: clone(updated), skippedDate: date,
+      affectedEvents: [clone(updated)], syncChanges: [{ event: clone(updated), op: 'upsert' }],
     };
   }
 }

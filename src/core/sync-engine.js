@@ -935,6 +935,14 @@ class SyncEngine {
     const selected = actions
       .map((action, index) => ({ action, index }))
       .filter(({ index }) => selectedIndices.has(index));
+    const chosenGroups = new Set();
+    for (const { action } of selected) {
+      if (!action.choice_group_id) continue;
+      if (chosenGroups.has(action.choice_group_id)) {
+        return [{ success: false, type: 'invalid_choice', message: '同一组候选方案只能选择一个。' }];
+      }
+      chosenGroups.add(action.choice_group_id);
+    }
     const approved = selected.map(({ action }) => {
         if (!action.id) return action;
         const local = this.eventStore.findEventByUuid(String(action.id));

@@ -170,8 +170,11 @@ class AgentAction(BaseModel):
     draft_id: Optional[str] = None
     event: Optional[Dict[str, Any]] = None
     updates: Optional[Dict[str, Any]] = None
-    scope: Optional[Literal["future", "all", "past"]] = None
+    scope: Optional[Literal["future", "all", "past", "single"]] = None
     effective_date: Optional[str] = None
+    # Mutually exclusive alternatives share a choice_group_id; approve at most one.
+    choice_group_id: Optional[str] = None
+    option_label: Optional[str] = None
 
 
 class AgentUsage(BaseModel):

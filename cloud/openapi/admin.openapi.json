@@ -1510,7 +1510,8 @@
                 "enum": [
                   "future",
                   "all",
-                  "past"
+                  "past",
+                  "single"
                 ]
               },
               {
@@ -1529,6 +1530,28 @@
               }
             ],
             "title": "Effective Date"
+          },
+          "choice_group_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Choice Group Id"
+          },
+          "option_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Option Label"
           }
         },
         "type": "object",
